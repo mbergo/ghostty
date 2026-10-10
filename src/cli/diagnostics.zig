@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const build_config = @import("../build_config.zig");
 
@@ -93,7 +93,7 @@ pub const Location = union(enum) {
 /// and potentially in the future structure them differently.
 pub const DiagnosticList = struct {
     /// The list of diagnostics.
-    list: std.ArrayListUnmanaged(Diagnostic) = .{},
+    list: std.ArrayList(Diagnostic) = .empty,
 
     /// Precomputed data for diagnostics. This is used specifically
     /// when we build libghostty so that we can precompute the messages
@@ -111,7 +111,7 @@ pub const DiagnosticList = struct {
     };
 
     const Precompute = if (precompute_enabled) struct {
-        messages: std.ArrayListUnmanaged([:0]const u8) = .{},
+        messages: std.ArrayList([:0]const u8) = .empty,
 
         pub fn clone(
             self: *const Precompute,

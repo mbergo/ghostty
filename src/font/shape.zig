@@ -1,4 +1,4 @@
-const builtin = @import("builtin");
+const std = @import("std");
 const options = @import("main.zig").options;
 const run = @import("shaper/run.zig");
 const feature = @import("shaper/feature.zig");
@@ -19,6 +19,7 @@ pub const default_features = feature.default_features;
 /// Shaper implementation for our compile options.
 pub const Shaper = switch (options.backend) {
     .freetype,
+    .freetype_windows,
     .fontconfig_freetype,
     .coretext_freetype,
     .coretext_harfbuzz,
@@ -34,8 +35,8 @@ pub const Shaper = switch (options.backend) {
     .web_canvas => web_canvas.Shaper,
 };
 
-/// A cell is a single single within a terminal that should be rendered
-/// for a shaping call. Note all terminal cells may be present; only
+/// A cell is a single glyph within a terminal that should be rendered
+/// for a shaping call. Not all terminal cells may be present; only
 /// cells that have a glyph that needs to be rendered.
 pub const Cell = struct {
     /// The X position of this shaper cell relative to the offset of the
@@ -72,17 +73,11 @@ pub const RunOptions = struct {
     /// cached values may be updated during shaping.
     grid: *SharedGrid,
 
-    /// The terminal screen to shape.
-    screen: *const terminal.Screen,
+    /// The cells for the row to shape.
+    cells: std.MultiArrayList(terminal.RenderState.Cell).Slice = .empty,
 
-    /// The row within the screen to shape. This row must exist within
-    /// screen; it is not validated.
-    row: terminal.Pin,
-
-    /// The selection boundaries. This is used to break shaping on
-    /// selection boundaries. This can be disabled by setting this to
-    /// null.
-    selection: ?terminal.Selection = null,
+    /// The x boundaries of the selection in this row.
+    selection: ?[2]u16 = null,
 
     /// The cursor position within this row. This is used to break shaping
     /// on cursor boundaries. This can be disabled by setting this to

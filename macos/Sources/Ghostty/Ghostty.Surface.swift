@@ -10,7 +10,9 @@ extension Ghostty {
     ///
     /// Wraps a `ghostty_surface_t`
     final class Surface: Sendable {
-        private let surface: ghostty_surface_t
+        /// A surface is sendable because it is just a reference type. Using the surface in parameters
+        /// may be unsafe but the value itself is safe to send across threads.
+        nonisolated(unsafe) private let surface: ghostty_surface_t
 
         /// Read the underlying C value for this surface. This is unsafe because the value will be
         /// freed when the Surface class is deinitialized.
@@ -24,6 +26,13 @@ extension Ghostty {
         }
 
         deinit {
+            guard !Thread.isMainThread else {
+                // The surface remains registered with the app and holds unretained
+                // userdata until it is freed. When already on the main thread, free
+                // it synchronously so teardown completes before we disappear.
+                ghostty_surface_free(surface)
+                return
+            }
             // deinit is not guaranteed to happen on the main actor and our API
             // calls into libghostty must happen there so we capture the surface
             // value so we don't capture `self` and then we detach it in a task.
@@ -35,17 +44,29 @@ extension Ghostty {
             }
         }
 
-        /// Send text to the terminal as if it was typed. This doesn't send the key events so keyboard
-        /// shortcuts and other encodings do not take effect.
+        /// Send text to the terminal using paste semantics. This doesn't send key events, so keyboard
+        /// shortcuts and other encodings do not take effect. Bracketed paste framing is applied when
+        /// the terminal has enabled it.
         @MainActor
         func sendText(_ text: String) {
             let len = text.utf8CString.count
-            if (len == 0) { return }
+            if len == 0 { return }
 
             text.withCString { ptr in
                 // len includes the null terminator so we do len - 1
                 ghostty_surface_text(surface, ptr, UInt(len - 1))
             }
+        }
+
+        /// Returns the modifiers that participate in text translation for key
+        /// events on this surface. This honors configuration such as
+        /// `macos-option-as-alt`, which may exclude option from translation.
+        ///
+        /// - Parameter mods: The full set of modifiers for the key event.
+        /// - Returns: The subset of `mods` to use for keyboard layout translation.
+        @MainActor
+        func keyTranslationMods(_ mods: Input.Mods) -> Input.Mods {
+            Input.Mods(cMods: ghostty_surface_key_translation_mods(surface, mods.cMods))
         }
 
         /// Send a key event to the terminal.
@@ -62,6 +83,26 @@ extension Ghostty {
             }
         }
 
+        /// Check if a key event matches a keybinding.
+        ///
+        /// This checks whether the given key event would trigger a keybinding in the terminal.
+        /// If it matches, returns the binding flags indicating properties of the matched binding.
+        ///
+        /// - Parameter event: The key event to check
+        /// - Returns: The binding flags if a binding matches, or nil if no binding matches
+        @MainActor
+        func keyIsBinding(_ event: ghostty_input_key_s) -> Input.BindingFlags? {
+            var flags = ghostty_binding_flags_e(0)
+            guard ghostty_surface_key_is_binding(surface, event, &flags) else { return nil }
+            return Input.BindingFlags(cFlags: flags)
+        }
+
+        /// See `keyIsBinding(_ event: ghostty_input_key_s)`.
+        @MainActor
+        func keyIsBinding(_ event: Input.KeyEvent) -> Input.BindingFlags? {
+            event.withCValue { keyIsBinding($0) }
+        }
+
         /// Whether the terminal has captured mouse input.
         ///
         /// When the mouse is captured, the terminal application is receiving mouse events
@@ -70,6 +111,21 @@ extension Ghostty {
         @MainActor
         var mouseCaptured: Bool {
             ghostty_surface_mouse_captured(surface)
+        }
+
+        /// The PID of the foreground process group attached to the PTY.
+        @MainActor
+        var foregroundPID: Int? {
+            let pid = ghostty_surface_foreground_pid(surface)
+            guard pid != 0 else { return nil }
+            return Int(exactly: pid)
+        }
+
+        /// The PTY device name for this surface.
+        @MainActor
+        var ttyName: String? {
+            let ttyName = AllocatedString(ghostty_surface_tty_name(surface)).string
+            return ttyName.isEmpty ? nil : ttyName
         }
 
         /// Send a mouse button event to the terminal.
@@ -129,21 +185,10 @@ extension Ghostty {
         @MainActor
         func perform(action: String) -> Bool {
             let len = action.utf8CString.count
-            if (len == 0) { return false }
+            if len == 0 { return false }
             return action.withCString { cString in
                 ghostty_surface_binding_action(surface, cString, UInt(len - 1))
             }
-        }
-
-        /// Command options for this surface.
-        @MainActor
-        func commands() throws -> [Command] {
-            var ptr: UnsafeMutablePointer<ghostty_command_s>? = nil
-            var count: Int = 0
-            ghostty_surface_commands(surface, &ptr, &count)
-            guard let ptr else { throw Error.apiFailed }
-            let buffer = UnsafeBufferPointer(start: ptr, count: count)
-            return Array(buffer).map { Command(cValue: $0) }.filter { $0.isSupported }
         }
     }
 }

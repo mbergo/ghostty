@@ -1,6 +1,5 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
 const hash_map = @import("hash_map.zig");
 const AutoOffsetHashMap = hash_map.AutoOffsetHashMap;
 const pagepkg = @import("page.zig");
@@ -14,13 +13,14 @@ const autoHash = std.hash.autoHash;
 const autoHashStrat = std.hash.autoHashStrat;
 
 /// The unique identifier for a hyperlink. This is at most the number of cells
-/// that can fit in a single terminal page.
-pub const Id = size.CellCountInt;
+/// that can fit in a single terminal page, since each cell can only contain
+/// at most one hyperlink.
+pub const Id = size.HyperlinkCountInt;
 
 // The mapping of cell to hyperlink. We use an offset hash map to save space
 // since its very unlikely a cell is a hyperlink, so its a waste to store
 // the hyperlink ID in the cell itself.
-pub const Map = AutoOffsetHashMap(Offset(Cell), Id);
+pub const Map = AutoOffsetHashMap(Offset(Cell), Id, 80);
 
 /// A fully decoded hyperlink that may or may not have its
 /// memory within a page. The memory location of this is dependent
@@ -103,7 +103,7 @@ pub const PageEntry = struct {
 
         // Copy the URI
         {
-            const uri = self.uri.offset.ptr(self_page.memory)[0..self.uri.len];
+            const uri = self.uri.slice(self_page.memory);
             const buf = try dst_page.string_alloc.alloc(u8, dst_page.memory, uri.len);
             @memcpy(buf, uri);
             copy.uri = .{
@@ -113,14 +113,14 @@ pub const PageEntry = struct {
         }
         errdefer dst_page.string_alloc.free(
             dst_page.memory,
-            copy.uri.offset.ptr(dst_page.memory)[0..copy.uri.len],
+            copy.uri.slice(dst_page.memory),
         );
 
         // Copy the ID
         switch (copy.id) {
             .implicit => {}, // Shallow is fine
             .explicit => |slice| {
-                const id = slice.offset.ptr(self_page.memory)[0..slice.len];
+                const id = slice.slice(self_page.memory);
                 const buf = try dst_page.string_alloc.alloc(u8, dst_page.memory, id.len);
                 @memcpy(buf, id);
                 copy.id = .{ .explicit = .{
@@ -133,7 +133,7 @@ pub const PageEntry = struct {
             .implicit => {},
             .explicit => |v| dst_page.string_alloc.free(
                 dst_page.memory,
-                v.offset.ptr(dst_page.memory)[0..v.len],
+                v.slice(dst_page.memory),
             ),
         };
 
@@ -147,13 +147,13 @@ pub const PageEntry = struct {
             .implicit => |v| autoHash(&hasher, v),
             .explicit => |slice| autoHashStrat(
                 &hasher,
-                slice.offset.ptr(base)[0..slice.len],
+                slice.slice(base),
                 .Deep,
             ),
         }
         autoHashStrat(
             &hasher,
-            self.uri.offset.ptr(base)[0..self.uri.len],
+            self.uri.slice(base),
             .Deep,
         );
         return hasher.final();
@@ -181,8 +181,8 @@ pub const PageEntry = struct {
 
         return std.mem.eql(
             u8,
-            self.uri.offset.ptr(self_base)[0..self.uri.len],
-            other.uri.offset.ptr(other_base)[0..other.uri.len],
+            self.uri.slice(self_base),
+            other.uri.slice(other_base),
         );
     }
 
@@ -194,14 +194,14 @@ pub const PageEntry = struct {
         const alloc = &page.string_alloc;
         switch (self.id) {
             .implicit => {},
-            .explicit => |v| alloc.free(
+            .explicit => |v| if (v.len > 0) alloc.free(
                 page.memory,
-                v.offset.ptr(page.memory)[0..v.len],
+                v.slice(page.memory),
             ),
         }
-        alloc.free(
+        if (self.uri.len > 0) alloc.free(
             page.memory,
-            self.uri.offset.ptr(page.memory)[0..self.uri.len],
+            self.uri.slice(page.memory),
         );
     }
 };

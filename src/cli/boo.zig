@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const args = @import("args.zig");
 const Action = @import("ghostty.zig").Action;
 const Allocator = std.mem.Allocator;
-const help_strings = @import("help_strings");
+const global = @import("../global.zig");
 const vaxis = @import("vaxis");
 
 const framedata = @import("framedata").compressed;
@@ -174,6 +174,9 @@ const Boo = struct {
 
 /// The `boo` command is used to display the animation from the Ghostty website in the terminal
 pub fn run(gpa: Allocator) !u8 {
+    var env_map = try global.environMap();
+    defer env_map.deinit();
+
     // Disable on non-desktop systems.
     switch (builtin.os.tag) {
         .windows, .macos, .linux, .freebsd => {},
@@ -184,7 +187,7 @@ pub fn run(gpa: Allocator) !u8 {
     defer opts.deinit();
 
     {
-        var iter = try args.argsIterator(gpa);
+        var iter = try args.argsIterator(gpa, global.args());
         defer iter.deinit();
         try args.parse(Options, gpa, &opts, &iter);
     }
@@ -195,7 +198,7 @@ pub fn run(gpa: Allocator) !u8 {
         gpa.free(decompressed_data);
     }
 
-    var app = try vxfw.App.init(gpa);
+    var app = try vxfw.App.init(global.io(), gpa, &env_map, &.{});
     defer app.deinit();
 
     var boo: Boo = undefined;

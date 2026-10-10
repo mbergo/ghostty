@@ -7,12 +7,13 @@ const font = @import("font.zig");
 const shapepkg = @import("shape.zig");
 const versionpkg = @import("version.zig");
 
-pub const c = @import("c.zig").c;
+pub const c = @import("hb_c");
 pub const freetype = @import("freetype.zig");
 pub const coretext = @import("coretext.zig");
 pub const MemoryMode = blob.MemoryMode;
 pub const Blob = blob.Blob;
 pub const Buffer = buffer.Buffer;
+pub const GlyphPosition = buffer.GlyphPosition;
 pub const Direction = common.Direction;
 pub const Script = common.Script;
 pub const Language = common.Language;

@@ -1,21 +1,35 @@
 const std = @import("std");
-const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const apprt = @import("../apprt.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
+const MessageData = @import("../datastruct/main.zig").MessageData;
 
 /// The messages that can be sent to an IO thread.
 ///
 /// This is not a tiny structure (~40 bytes at the time of writing this comment),
-/// but the messages are IO thread sends are also very few. At the current size
-/// we can queue 26,000 messages before consuming a MB of RAM.
+/// but the number of messages we send to the IO thread is also very small.
+/// At the current size we can queue 26,000 messages before consuming a MB of RAM.
 pub const Message = union(enum) {
     /// Represents a write request. Magic number comes from the largest
     /// other union value. It can be upped if we add a larger union member
     /// in the future.
     pub const WriteReq = MessageData(u8, 38);
+
+    /// Request a color scheme report is sent to the PTY.
+    color_scheme_report: struct {
+        /// Force write the current color scheme
+        force: bool,
+    },
+
+    /// Request a visibility report is sent to the PTY.
+    visibility_report: struct {
+        /// The visibility state to report.
+        visible: bool,
+
+        /// Send the report even when mode 2033 is disabled.
+        force: bool,
+    },
 
     /// Purposely crash the renderer. This is used for testing and debugging.
     /// See the "crash" binding action.
@@ -34,7 +48,7 @@ pub const Message = union(enum) {
     /// Resize the window.
     resize: renderer.Size,
 
-    /// Request a size report is sent to the pty ([in-band
+    /// Request a size report is sent to the PTY ([in-band
     /// size report, mode 2048](https://gist.github.com/rockorager/e695fb2924d36b2bcf1fff4a3704bd83) and
     /// [XTWINOPS](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h4-Functions-using-CSI-_-ordered-by-the-final-character-lparen-s-rparen:CSI-Ps;Ps;Ps-t.1EB0)).
     size_report: SizeReport,
@@ -68,6 +82,12 @@ pub const Message = union(enum) {
     /// The surface gained or lost focus.
     focused: bool,
 
+    /// Record a Kitty clipboard protocol session grant for a password
+    /// so future requests carrying it skip the permission prompt, for
+    /// reads and writes respectively.
+    kitty_clipboard_grant_read: KittyClipboardGrant,
+    kitty_clipboard_grant_write: KittyClipboardGrant,
+
     /// Write where the data fits in the union.
     write_small: WriteReq.Small,
 
@@ -76,6 +96,13 @@ pub const Message = union(enum) {
 
     /// Write where the data is allocated and must be freed.
     write_alloc: WriteReq.Alloc,
+
+    /// The payload of the kitty_clipboard_grant_* messages. The
+    /// password is allocated and must be freed.
+    pub const KittyClipboardGrant = struct {
+        alloc: Allocator,
+        pw: []const u8,
+    };
 
     /// Return a write request for the given data. This will use
     /// write_small if it fits or write_alloc otherwise. This should NOT
@@ -88,103 +115,25 @@ pub const Message = union(enum) {
         };
     }
 
-    /// The types of size reports that we support
-    pub const SizeReport = enum {
-        mode_2048,
-        csi_14_t,
-        csi_16_t,
-        csi_18_t,
-    };
+    /// Free resources owned by a message that will not be processed.
+    /// The message is invalid after this call.
+    pub fn deinit(self: *const Message) void {
+        switch (self.*) {
+            .change_config => |v| {
+                v.ptr.deinit();
+                v.alloc.destroy(v.ptr);
+            },
+            .write_alloc => |v| v.alloc.free(v.data),
+            .kitty_clipboard_grant_read,
+            .kitty_clipboard_grant_write,
+            => |v| v.alloc.free(v.pw),
+            else => {},
+        }
+    }
+
+    /// The types of size reports that we support.
+    pub const SizeReport = terminal.size_report.Style;
 };
-
-/// Creates a union that can be used to accommodate data that fit within an array,
-/// are a stable pointer, or require deallocation. This is helpful for thread
-/// messaging utilities.
-pub fn MessageData(comptime Elem: type, comptime small_size: comptime_int) type {
-    return union(enum) {
-        pub const Self = @This();
-
-        pub const Small = struct {
-            pub const Max = small_size;
-            pub const Array = [Max]Elem;
-            pub const Len = std.math.IntFittingRange(0, small_size);
-            data: Array = undefined,
-            len: Len = 0,
-        };
-
-        pub const Alloc = struct {
-            alloc: Allocator,
-            data: []Elem,
-        };
-
-        pub const Stable = []const Elem;
-
-        /// A small write where the data fits into this union size.
-        small: Small,
-
-        /// A stable pointer so we can just pass the slice directly through.
-        /// This is useful i.e. for const data.
-        stable: Stable,
-
-        /// Allocated and must be freed with the provided allocator. This
-        /// should be rarely used.
-        alloc: Alloc,
-
-        /// Initializes the union for a given data type. This will
-        /// attempt to fit into a small value if possible, otherwise
-        /// will allocate and put into alloc.
-        ///
-        /// This can't and will never detect stable pointers.
-        pub fn init(alloc: Allocator, data: anytype) !Self {
-            switch (@typeInfo(@TypeOf(data))) {
-                .pointer => |info| {
-                    assert(info.size == .slice);
-                    assert(info.child == Elem);
-
-                    // If it fits in our small request, do that.
-                    if (data.len <= Small.Max) {
-                        var buf: Small.Array = undefined;
-                        @memcpy(buf[0..data.len], data);
-                        return Self{
-                            .small = .{
-                                .data = buf,
-                                .len = @intCast(data.len),
-                            },
-                        };
-                    }
-
-                    // Otherwise, allocate
-                    const buf = try alloc.dupe(Elem, data);
-                    errdefer alloc.free(buf);
-                    return Self{
-                        .alloc = .{
-                            .alloc = alloc,
-                            .data = buf,
-                        },
-                    };
-                },
-
-                else => unreachable,
-            }
-        }
-
-        pub fn deinit(self: Self) void {
-            switch (self) {
-                .small, .stable => {},
-                .alloc => |v| v.alloc.free(v.data),
-            }
-        }
-
-        /// Returns a const slice of the data pointed to by this request.
-        pub fn slice(self: *const Self) []const Elem {
-            return switch (self.*) {
-                .small => |*v| v.data[0..v.len],
-                .stable => |v| v,
-                .alloc => |v| v.data,
-            };
-        }
-    };
-}
 
 test {
     std.testing.refAllDecls(@This());
@@ -194,36 +143,4 @@ test {
     // Ensure we don't grow our IO message size without explicitly wanting to.
     const testing = std.testing;
     try testing.expectEqual(@as(usize, 40), @sizeOf(Message));
-}
-
-test "MessageData init small" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    const Data = MessageData(u8, 10);
-    const input = "hello!";
-    const io = try Data.init(alloc, @as([]const u8, input));
-    try testing.expect(io == .small);
-}
-
-test "MessageData init alloc" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    const Data = MessageData(u8, 10);
-    const input = "hello! " ** 100;
-    const io = try Data.init(alloc, @as([]const u8, input));
-    try testing.expect(io == .alloc);
-    io.alloc.alloc.free(io.alloc.data);
-}
-
-test "MessageData small fits non-u8 sized data" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    const len = 500;
-    const Data = MessageData(u8, len);
-    const input: []const u8 = "X" ** len;
-    const io = try Data.init(alloc, input);
-    try testing.expect(io == .small);
 }

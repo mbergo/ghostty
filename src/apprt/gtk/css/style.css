@@ -35,6 +35,30 @@ label.url-overlay.right {
 }
 
 /*
+ * GhosttySurface search overlay
+ */
+.search-overlay {
+  padding: 6px 8px;
+  margin: 8px;
+  border-radius: 8px;
+  outline-style: solid;
+  outline-color: #555555;
+  outline-width: 1px;
+}
+
+/*
+ * GhosttySurface key state overlay
+ */
+.key-state-overlay {
+  padding: 6px 10px;
+  margin: 8px;
+  border-radius: 8px;
+  outline-style: solid;
+  outline-color: #555555;
+  outline-width: 1px;
+}
+
+/*
  * GhosttySurface resize overlay
  */
 label.resize-overlay {
@@ -103,11 +127,73 @@ label.resize-overlay {
 }
 
 .surface .bell-overlay {
-  border-color: rgba(58, 148, 74, 0.5);
+  border-color: rgba(53, 132, 228, 0.5);
   /* after GTK 4.16 is a requirement, switch to the following: */
   /* background-color: color-mix(in srgb, var(--accent-color), transparent 50%); */
   border-width: 3px;
   border-style: solid;
+}
+
+.surface .readonly_overlay {
+  /* Should be the equivalent of the following SwiftUI color: */
+  /* Color(hue: 0.08, saturation: 0.5, brightness: 0.8) */
+  color: hsl(25 50 75);
+  padding: 8px 8px 8px 8px;
+  margin: 8px 8px 8px 8px;
+  border-radius: 6px 6px 6px 6px;
+  outline-style: solid;
+  outline-width: 1px;
+}
+/*
+ * Drag and drop overlay
+ */
+.drag-handle {
+  background-color: rgba(0, 0, 0, 0.15);
+  opacity: 0;
+  transition: 0.1s opacity;
+}
+.drag-handle:hover {
+  opacity: 1;
+}
+.drop-overlay.drop-left {
+  /* after GTK 4.16 is a requirement, switch to the following: */
+  /* background: linear-gradient(to left, transparent, 50%, color-mix(in srgb, var(--accent-color), transparent 50%) 50%); */
+  background: linear-gradient(
+    to left,
+    transparent,
+    50%,
+    rgba(53, 132, 228, 0.2) 50%
+  );
+}
+.drop-overlay.drop-right {
+  /* after GTK 4.16 is a requirement, switch to the following: */
+  /* background: linear-gradient(to right, transparent, 50%, color-mix(in srgb, var(--accent-color), transparent 50%) 50%); */
+  background: linear-gradient(
+    to right,
+    transparent,
+    50%,
+    rgba(53, 132, 228, 0.2) 50%
+  );
+}
+.drop-overlay.drop-top {
+  /* after GTK 4.16 is a requirement, switch to the following: */
+  /* background: linear-gradient(to top, transparent, 50%, color-mix(in srgb, var(--accent-color), transparent 50%) 50%); */
+  background: linear-gradient(
+    to top,
+    transparent,
+    50%,
+    rgba(53, 132, 228, 0.2) 50%
+  );
+}
+.drop-overlay.drop-bottom {
+  /* after GTK 4.16 is a requirement, switch to the following: */
+  /* background: linear-gradient(to bottom, transparent, 50%, color-mix(in srgb, var(--accent-color), transparent 50%) 50%); */
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    50%,
+    rgba(53, 132, 228, 0.2) 50%
+  );
 }
 
 /*

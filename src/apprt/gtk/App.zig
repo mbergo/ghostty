@@ -5,38 +5,24 @@ const App = @This();
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const adw = @import("adw");
-const gio = @import("gio");
 const apprt = @import("../../apprt.zig");
 const configpkg = @import("../../config.zig");
-const internal_os = @import("../../os/main.zig");
 const Config = configpkg.Config;
 const CoreApp = @import("../../App.zig");
 
 const Application = @import("class/application.zig").Application;
 const Surface = @import("Surface.zig");
-const gtk_version = @import("gtk_version.zig");
-const adw_version = @import("adw_version.zig");
 const ipcNewWindow = @import("ipc/new_window.zig").newWindow;
+const ipcNewTab = @import("ipc/new_tab.zig").newTab;
+const ipcToggleQuickTerminal = @import("ipc/toggle_quick_terminal.zig").toggleQuickTerminal;
 
 const log = std.log.scoped(.gtk);
 
-/// This is detected by the Renderer, in which case it sends a `redraw_surface`
-/// message so that we can call `drawFrame` ourselves from the app thread,
-/// because GTK's `GLArea` does not support drawing from a different thread.
-pub const must_draw_from_app_thread = true;
-
 /// GTK application ID
-pub const application_id = switch (builtin.mode) {
-    .Debug, .ReleaseSafe => "com.mitchellh.ghostty-debug",
-    .ReleaseFast, .ReleaseSmall => "com.mitchellh.ghostty",
-};
+pub const application_id = @import("build/info.zig").application_id;
 
 /// GTK object path
-pub const object_path = switch (builtin.mode) {
-    .Debug, .ReleaseSafe => "/com/mitchellh/ghostty_debug",
-    .ReleaseFast, .ReleaseSmall => "/com/mitchellh/ghostty",
-};
+pub const object_path = @import("build/info.zig").object_path;
 
 /// The GObject Application instance
 app: *Application,
@@ -95,6 +81,8 @@ pub fn performIpc(
 ) !bool {
     switch (action) {
         .new_window => return try ipcNewWindow(alloc, target, value),
+        .new_tab => return try ipcNewTab(alloc, target, value),
+        .toggle_quick_terminal => return try ipcToggleQuickTerminal(alloc, target),
     }
 }
 

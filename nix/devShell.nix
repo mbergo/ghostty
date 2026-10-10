@@ -8,10 +8,11 @@
   appstream,
   flatpak-builder,
   gdb,
+  cmake,
   #, glxinfo # unused
   ncurses,
   nodejs,
-  nodePackages,
+  prettier,
   oniguruma,
   parallel,
   pkg-config,
@@ -23,7 +24,11 @@
   #, vulkan-loader # unused
   vttest,
   wabt,
+  wasm-tools,
   wasmtime,
+  binaryen,
+  twiggy,
+  wizer,
   wraptest,
   zig,
   zip,
@@ -44,6 +49,7 @@
   adwaita-icon-theme,
   hicolor-icon-theme,
   harfbuzz,
+  libglvnd,
   libpng,
   libxkbcommon,
   libX11,
@@ -58,6 +64,7 @@
   zlib,
   alejandra,
   jq,
+  kaitai-struct-compiler,
   minisign,
   pandoc,
   pinact,
@@ -65,12 +72,12 @@
   poop,
   typos,
   shellcheck,
+  swiftlint,
   uv,
   wayland,
   wayland-scanner,
   wayland-protocols,
   zon2nix,
-  system,
   pkgs,
   # needed by GTK for loading SVG icons while running from within the
   # developer shell
@@ -84,12 +91,19 @@
   gi_typelib_path = import ./build-support/gi-typelib-path.nix {
     inherit pkgs lib stdenv;
   };
+  python = python3.withPackages (python-pkgs: [
+    python-pkgs.jsonschema
+    python-pkgs.kaitaistruct
+    python-pkgs.ucs-detect
+    python-pkgs.wasmtime
+  ]);
 in
   mkShell {
     name = "ghostty";
     packages =
       [
         # For builds
+        cmake
         doxygen
         jq
         llvmPackages_latest.llvm
@@ -100,13 +114,13 @@ in
         scdoc
         zig
         zip
-        zon2nix.packages.${system}.zon2nix
+        zon2nix.packages.${stdenv.hostPlatform.system}.zon2nix
 
         # For web and wasm stuff
         nodejs
 
         # Linting
-        nodePackages.prettier
+        prettier
         alejandra
         pinact
         typos
@@ -114,13 +128,18 @@ in
 
         # Testing
         parallel
-        python3
+        python
         vttest
         hyperfine
+        kaitai-struct-compiler
 
         # wasm
+        binaryen
+        twiggy
         wabt
+        wasm-tools
         wasmtime
+        wizer
 
         # Localization
         gettext
@@ -167,6 +186,7 @@ in
         glslang
         spirv-cross
 
+        libglvnd
         libxkbcommon
         libX11
         libXcursor
@@ -193,6 +213,9 @@ in
 
         # for benchmarking
         poop
+      ]
+      ++ lib.optionals stdenv.hostPlatform.isDarwin [
+        swiftlint
       ];
 
     # This should be set onto the rpath of the ghostty binary if you want
@@ -211,13 +234,26 @@ in
       '')
       + (lib.optionalString stdenv.hostPlatform.isDarwin ''
         # On macOS, we unset the macOS SDK env vars that Nix sets up because
-        # we rely on a system installation. Nix only provides a macOS SDK
-        # and we need iOS too.
+        # we rely on a system installation. Nix only provides a macOS SDK.
         unset SDKROOT
         unset DEVELOPER_DIR
+
+        # AFL++ needs to use the Homebrew/system Apple toolchain directly.
+        # The Nix compiler wrapper variables leak a Nix linker into afl-cc,
+        # which breaks even trivial fuzz harness links on macOS.
+        unset NIX_CC
+        unset NIX_CFLAGS_COMPILE
+        unset NIX_LDFLAGS
+        unset LD
+        unset CC
+        unset CXX
+        unset CFLAGS
+        unset CPPFLAGS
+        unset LDFLAGS
 
         # We need to remove "xcrun" from the PATH. It is injected by
         # some dependency but we need to rely on system Xcode tools
         export PATH=$(echo "$PATH" | awk -v RS=: -v ORS=: '$0 !~ /xcrun/ || $0 == "/usr/bin" {print}' | sed 's/:$//')
+        export PATH="${python}/bin:/opt/homebrew/opt/llvm/bin:/opt/homebrew/bin:/usr/local/opt/llvm/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
       '');
   }

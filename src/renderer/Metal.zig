@@ -2,7 +2,7 @@
 pub const Metal = @This();
 
 const std = @import("std");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 const objc = @import("objc");
@@ -17,6 +17,7 @@ const shadertoy = @import("shadertoy.zig");
 
 const mtl = @import("metal/api.zig");
 const IOSurfaceLayer = @import("metal/IOSurfaceLayer.zig");
+pub const Device = @import("metal/Device.zig");
 
 pub const GraphicsAPI = Metal;
 pub const Target = @import("metal/Target.zig");
@@ -40,25 +41,23 @@ const log = std.log.scoped(.metal);
 
 layer: IOSurfaceLayer,
 
-/// MTLDevice
-device: objc.Object,
+/// The shared render device.
+device: *const Device,
+
 /// MTLCommandQueue
 queue: objc.Object,
 
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
 
-/// The default storage mode to use for resources created with our device.
-///
-/// This is based on whether the device is a discrete GPU or not, since
-/// discrete GPUs do not have unified memory and therefore do not support
-/// the "shared" storage mode, instead we have to use the "managed" mode.
-default_storage_mode: mtl.MTLResourceOptions.StorageMode,
-
 /// We start an AutoreleasePool before `drawFrame` and end it afterwards.
 autorelease_pool: ?*objc.AutoreleasePool = null,
 
-pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
+pub fn init(
+    alloc: Allocator,
+    device: *const Device,
+    opts: rendererpkg.Options,
+) !Metal {
     comptime switch (builtin.os.tag) {
         .macos, .ios => {},
         else => @compileError("unsupported platform for Metal"),
@@ -66,14 +65,10 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
 
     _ = alloc;
 
-    // Choose our MTLDevice and create a MTLCommandQueue for that device.
-    const device = try chooseDevice();
-    errdefer device.release();
-    const queue = device.msgSend(objc.Object, objc.sel("newCommandQueue"), .{});
+    // Create a MTLCommandQueue for our app-scoped MTLDevice.
+    const mtl_device = device.device;
+    const queue = mtl_device.msgSend(objc.Object, objc.sel("newCommandQueue"), .{});
     errdefer queue.release();
-
-    const default_storage_mode: mtl.MTLResourceOptions.StorageMode =
-        if (device.getProperty(bool, "hasUnifiedMemory")) .shared else .managed;
 
     const ViewInfo = struct {
         view: objc.Object,
@@ -114,7 +109,8 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
         },
 
         .ios => {
-            info.view.msgSend(void, objc.sel("addSublayer"), .{layer.layer.value});
+            const view_layer = objc.Object.fromId(info.view.getProperty(?*anyopaque, "layer"));
+            view_layer.msgSend(void, objc.sel("addSublayer:"), .{layer.layer.value});
         },
 
         else => @compileError("unsupported target for Metal"),
@@ -137,13 +133,15 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
         .device = device,
         .queue = queue,
         .blending = opts.config.blending,
-        .default_storage_mode = default_storage_mode,
     };
 }
 
 pub fn deinit(self: *Metal) void {
     self.queue.release();
-    self.device.release();
+
+    // The MTLDevice is app-scoped and destroyed
+    // by the render device, not by us.
+
     self.layer.release();
 }
 
@@ -185,7 +183,7 @@ pub fn initShaders(
 ) !shaders.Shaders {
     return try shaders.Shaders.init(
         alloc,
-        self.device,
+        self.device.device,
         custom_shaders,
         // Using an `*_srgb` pixel format makes Metal gamma encode
         // the pixels written to it *after* blending, which means
@@ -202,16 +200,26 @@ pub fn initShaders(
 pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
     const bounds = self.layer.layer.getProperty(graphics.Rect, "bounds");
     const scale = self.layer.layer.getProperty(f64, "contentsScale");
+
+    // We need to clamp our runtime surface size to the maximum
+    // possible texture size since we can't create a screen buffer (texture)
+    // larger than that.
     return .{
-        .width = @intFromFloat(bounds.size.width * scale),
-        .height = @intFromFloat(bounds.size.height * scale),
+        .width = @min(
+            @as(u32, @intFromFloat(bounds.size.width * scale)),
+            self.device.max_texture_size,
+        ),
+        .height = @min(
+            @as(u32, @intFromFloat(bounds.size.height * scale)),
+            self.device.max_texture_size,
+        ),
     };
 }
 
 /// Initialize a new render target which can be presented by this API.
 pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
     return Target.init(.{
-        .device = self.device,
+        .device = self.device.device,
         // Using an `*_srgb` pixel format makes Metal gamma encode the pixels
         // written to it *after* blending, which means we get linear alpha
         // blending rather than gamma-incorrect blending.
@@ -219,7 +227,7 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
             .bgra8unorm_srgb
         else
             .bgra8unorm,
-        .storage_mode = self.default_storage_mode,
+        .storage_mode = self.device.default_storage_mode,
         .width = width,
         .height = height,
     });
@@ -234,19 +242,14 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     }
 }
 
-/// Present the last presented target again. (noop for Metal)
-pub inline fn presentLastTarget(self: *Metal) !void {
-    _ = self;
-}
-
 /// Returns the options to use when constructing buffers.
 pub inline fn bufferOptions(self: Metal) bufferpkg.Options {
     return .{
-        .device = self.device,
+        .device = self.device.device,
         .resource_options = .{
             // Indicate that the CPU writes to this resource but never reads it.
             .cpu_cache_mode = .write_combined,
-            .storage_mode = self.default_storage_mode,
+            .storage_mode = self.device.default_storage_mode,
         },
     };
 }
@@ -261,7 +264,7 @@ pub const bgImageBufferOptions = bufferOptions;
 /// Returns the options to use when constructing textures.
 pub inline fn textureOptions(self: Metal) Texture.Options {
     return .{
-        .device = self.device,
+        .device = self.device.device,
         // Using an `*_srgb` pixel format makes Metal gamma encode the pixels
         // written to it *after* blending, which means we get linear alpha
         // blending rather than gamma-incorrect blending.
@@ -272,7 +275,7 @@ pub inline fn textureOptions(self: Metal) Texture.Options {
         .resource_options = .{
             // Indicate that the CPU writes to this resource but never reads it.
             .cpu_cache_mode = .write_combined,
-            .storage_mode = self.default_storage_mode,
+            .storage_mode = self.device.default_storage_mode,
         },
         .usage = .{
             // textureOptions is currently only used for custom shaders,
@@ -288,7 +291,7 @@ pub inline fn textureOptions(self: Metal) Texture.Options {
 
 pub inline fn samplerOptions(self: Metal) Sampler.Options {
     return .{
-        .device = self.device,
+        .device = self.device.device,
 
         // These parameters match Shadertoy behaviors.
         .min_filter = .linear,
@@ -326,12 +329,12 @@ pub inline fn imageTextureOptions(
     srgb: bool,
 ) Texture.Options {
     return .{
-        .device = self.device,
+        .device = self.device.device,
         .pixel_format = format.toPixelFormat(srgb),
         .resource_options = .{
             // Indicate that the CPU writes to this resource but never reads it.
             .cpu_cache_mode = .write_combined,
-            .storage_mode = self.default_storage_mode,
+            .storage_mode = self.device.default_storage_mode,
         },
         .usage = .{
             // We only need to read from this texture from a shader.
@@ -353,12 +356,12 @@ pub fn initAtlasTexture(
 
     return try Texture.init(
         .{
-            .device = self.device,
+            .device = self.device.device,
             .pixel_format = pixel_format,
             .resource_options = .{
                 // Indicate that the CPU writes to this resource but never reads it.
                 .cpu_cache_mode = .write_combined,
-                .storage_mode = self.default_storage_mode,
+                .storage_mode = self.device.default_storage_mode,
             },
             .usage = .{
                 // We only need to read from this texture from a shader.
@@ -381,34 +384,4 @@ pub inline fn beginFrame(
     target: *Target,
 ) !Frame {
     return try Frame.begin(.{ .queue = self.queue }, renderer, target);
-}
-
-fn chooseDevice() error{NoMetalDevice}!objc.Object {
-    var chosen_device: ?objc.Object = null;
-
-    switch (comptime builtin.os.tag) {
-        .macos => {
-            const devices = objc.Object.fromId(mtl.MTLCopyAllDevices());
-            defer devices.release();
-
-            var iter = devices.iterate();
-            while (iter.next()) |device| {
-                // We want a GPU that’s connected to a display.
-                if (device.getProperty(bool, "isHeadless")) continue;
-                chosen_device = device;
-                // If the user has an eGPU plugged in, they probably want
-                // to use it. Otherwise, integrated GPUs are better for
-                // battery life and thermals.
-                if (device.getProperty(bool, "isRemovable") or
-                    device.getProperty(bool, "isLowPower")) break;
-            }
-        },
-        .ios => {
-            chosen_device = objc.Object.fromId(mtl.MTLCreateSystemDefaultDevice());
-        },
-        else => @compileError("unsupported target for Metal"),
-    }
-
-    const device = chosen_device orelse return error.NoMetalDevice;
-    return device.retain();
 }

@@ -2,7 +2,6 @@
 //! library implementation(s) require per-process.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const builtin = @import("builtin");
 const options = @import("main.zig").options;
 const freetype = @import("freetype");
 const font = @import("main.zig");
@@ -11,6 +10,7 @@ const font = @import("main.zig");
 pub const Library = switch (options.backend) {
     // Freetype requires a state library
     .freetype,
+    .freetype_windows,
     .fontconfig_freetype,
     .coretext_freetype,
     => FreetypeLibrary,
@@ -30,7 +30,7 @@ pub const FreetypeLibrary = struct {
 
     /// Mutex to be held any time the library is
     /// being used to create or destroy a face.
-    mutex: *std.Thread.Mutex,
+    mutex: *std.Io.Mutex,
 
     pub const InitError = freetype.Error || Allocator.Error;
 
@@ -38,8 +38,8 @@ pub const FreetypeLibrary = struct {
         const lib = try freetype.Library.init();
         errdefer lib.deinit();
 
-        const mutex = try alloc.create(std.Thread.Mutex);
-        mutex.* = .{};
+        const mutex = try alloc.create(std.Io.Mutex);
+        mutex.* = .init;
 
         return Library{ .lib = lib, .alloc = alloc, .mutex = mutex };
     }

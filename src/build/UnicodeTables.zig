@@ -1,7 +1,6 @@
 const UnicodeTables = @This();
 
 const std = @import("std");
-const Config = @import("Config.zig");
 
 /// The exe.
 props_exe: *std.Build.Step.Compile,
@@ -55,8 +54,8 @@ pub fn init(b: *std.Build, uucode_tables: std.Build.LazyPath) !UnicodeTables {
 
     // Generated Zig files have to end with .zig
     const wf = b.addWriteFiles();
-    const props_output = wf.addCopyFile(props_run.captureStdOut(), "props.zig");
-    const symbols_output = wf.addCopyFile(symbols_run.captureStdOut(), "symbols.zig");
+    const props_output = wf.addCopyFile(props_run.captureStdOut(.{}), "props.zig");
+    const symbols_output = wf.addCopyFile(symbols_run.captureStdOut(.{}), "symbols.zig");
 
     return .{
         .props_exe = props_exe,

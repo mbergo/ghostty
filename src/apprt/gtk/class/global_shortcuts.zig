@@ -1,14 +1,12 @@
 const std = @import("std");
-const assert = std.debug.assert;
+const assert = @import("../../../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
-const adw = @import("adw");
 const gio = @import("gio");
 const glib = @import("glib");
 const gobject = @import("gobject");
-const gtk = @import("gtk");
+const global = @import("../../../global.zig");
 
 const Binding = @import("../../../input.zig").Binding;
-const gresource = @import("../build/gresource.zig");
 const key = @import("../key.zig");
 const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
@@ -85,6 +83,24 @@ pub const GlobalShortcuts = extern struct {
         pub var offset: c_int = 0;
     };
 
+    /// A global shortcut that failed to bind or was revoked.
+    /// Only valid for the duration of the signal emission.
+    pub const BindFailed = struct {
+        trigger: Binding.Trigger,
+        action: Binding.Action,
+
+        /// May be empty.
+        message: [*:0]const u8,
+
+        /// Revoked after binding rather than denied up front.
+        revoked: bool,
+
+        pub const getGObjectType = gobject.ext.defineBoxed(
+            BindFailed,
+            .{ .name = "GhosttyGlobalShortcutsBindFailed" },
+        );
+    };
+
     pub const signals = struct {
         /// Emitted whenever a global shortcut is triggered.
         pub const trigger = struct {
@@ -94,6 +110,18 @@ pub const GlobalShortcuts = extern struct {
                 name,
                 Self,
                 &.{*const Binding.Action},
+                void,
+            );
+        };
+
+        /// Emitted when a global shortcut fails to bind or is revoked.
+        pub const @"bind-failed" = struct {
+            pub const name = "bind-failed";
+            pub const connect = impl.connect;
+            const impl = gobject.ext.defineSignal(
+                name,
+                Self,
+                &.{*const BindFailed},
                 void,
             );
         };
@@ -111,34 +139,39 @@ pub const GlobalShortcuts = extern struct {
 
     fn close(self: *Self) void {
         const priv = self.private();
-        const dbus = priv.dbus_connection orelse return;
 
-        if (priv.response_subscription != 0) {
-            dbus.signalUnsubscribe(priv.response_subscription);
-            priv.response_subscription = 0;
-        }
+        // This is safe to call even if the winproto was already
+        // deinitialized, which happens during application teardown.
+        Application.default().winproto().clearGlobalShortcuts();
 
-        if (priv.activate_subscription != 0) {
-            dbus.signalUnsubscribe(priv.activate_subscription);
-            priv.activate_subscription = 0;
-        }
+        if (priv.dbus_connection) |dbus| {
+            if (priv.response_subscription != 0) {
+                dbus.signalUnsubscribe(priv.response_subscription);
+                priv.response_subscription = 0;
+            }
 
-        if (priv.handle) |handle| {
-            // Close existing session
-            dbus.call(
-                "org.freedesktop.portal.Desktop",
-                handle,
-                "org.freedesktop.portal.Session",
-                "Close",
-                null,
-                null,
-                .{},
-                -1,
-                null,
-                null,
-                null,
-            );
-            priv.handle = null;
+            if (priv.activate_subscription != 0) {
+                dbus.signalUnsubscribe(priv.activate_subscription);
+                priv.activate_subscription = 0;
+            }
+
+            if (priv.handle) |handle| {
+                // Close existing session
+                dbus.call(
+                    "org.freedesktop.portal.Desktop",
+                    handle,
+                    "org.freedesktop.portal.Session",
+                    "Close",
+                    null,
+                    null,
+                    .{},
+                    -1,
+                    null,
+                    null,
+                    null,
+                );
+                priv.handle = null;
+            }
         }
 
         if (priv.arena) |*arena| {
@@ -154,8 +187,18 @@ pub const GlobalShortcuts = extern struct {
 
         const priv = self.private();
 
-        // We need configuration to proceed.
+        // We need a configuration to proceed.
         const config = if (priv.config) |v| v.get() else return;
+
+        // Prefer a windowing protocol native mechanism over the
+        // XDG desktop portal when available.
+        if (Application.default().winproto().bindGlobalShortcuts(self, config)) {
+            log.debug("global shortcuts bound via winproto", .{});
+            return;
+        }
+
+        // The portal fallback requires a dbus connection.
+        if (priv.dbus_connection == null) return;
 
         // Setup our new arena that we'll use for memory allocations.
         assert(priv.arena == null);
@@ -172,12 +215,16 @@ pub const GlobalShortcuts = extern struct {
         var trigger_buf: [1024]u8 = undefined;
         var it = config.keybind.set.bindings.iterator();
         while (it.next()) |entry| {
-            const leaf = switch (entry.value_ptr.*) {
-                // Global shortcuts can't have leaders
+            const leaf: Binding.Set.GenericLeaf = switch (entry.value_ptr.*) {
                 .leader => continue,
-                .leaf => |leaf| leaf,
+                inline .leaf, .leaf_chained => |leaf| leaf.generic(),
             };
             if (!leaf.flags.global) continue;
+
+            // We only allow global keybinds that map to exactly a single
+            // action for now. TODO: remove this restriction
+            const actions = leaf.actionsSlice();
+            if (actions.len != 1) continue;
 
             const trigger = if (key.xdgShortcutFromTrigger(
                 &trigger_buf,
@@ -200,7 +247,7 @@ pub const GlobalShortcuts = extern struct {
             try priv.map.put(
                 alloc,
                 try alloc.dupeZ(u8, trigger),
-                leaf.action,
+                actions[0],
             );
         }
 
@@ -555,10 +602,25 @@ pub const GlobalShortcuts = extern struct {
         log.debug("activated={s}", .{shortcut_id});
 
         const action = self.private().map.get(std.mem.span(shortcut_id)) orelse return;
+        self.emitTrigger(&action);
+    }
+
+    /// Emit the trigger signal. Public for winproto shortcut backends.
+    pub fn emitTrigger(self: *Self, action: *const Binding.Action) void {
         signals.trigger.impl.emit(
             self,
             null,
-            .{&action},
+            .{action},
+            null,
+        );
+    }
+
+    /// Emit the bind-failed signal. Public for winproto shortcut backends.
+    pub fn emitBindFailed(self: *Self, failure: *const BindFailed) void {
+        signals.@"bind-failed".impl.emit(
+            self,
+            null,
+            .{failure},
             null,
         );
     }
@@ -608,6 +670,7 @@ pub const GlobalShortcuts = extern struct {
 
             // Signals
             signals.trigger.impl.register(.{});
+            signals.@"bind-failed".impl.register(.{});
 
             // Virtual methods
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);
@@ -627,6 +690,9 @@ fn generateToken(buf: *Token) [:0]const u8 {
     return std.fmt.bufPrintZ(
         buf,
         "ghostty_{x:0<7}",
-        .{std.crypto.random.int(u28)},
+        .{rand_int: {
+            const rng_impl: std.Random.IoSource = .{ .io = global.io() };
+            break :rand_int rng_impl.interface().int(u28);
+        }},
     ) catch unreachable;
 }

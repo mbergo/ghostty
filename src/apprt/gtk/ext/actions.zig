@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const assert = std.debug.assert;
+const assert = @import("../../../quirks.zig").inlineAssert;
 const testing = std.testing;
 
 const gio = @import("gio");
@@ -176,7 +176,11 @@ test "adding actions to an object" {
         _ = addAsGroup(gtk.Box, box, "test", &actions);
     }
 
-    const expected = std.crypto.random.intRangeAtMost(i32, 1, std.math.maxInt(u31));
+    const expected = expected: {
+        const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+        const rng = rng_impl.interface();
+        break :expected rng.intRangeAtMost(i32, 1, std.math.maxInt(u31));
+    };
     const parameter = glib.Variant.newInt32(expected);
 
     try testing.expect(box.as(gtk.Widget).activateActionVariant("test.test", parameter) != 0);

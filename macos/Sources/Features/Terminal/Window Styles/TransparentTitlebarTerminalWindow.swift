@@ -7,16 +7,17 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
     /// This is necessary because various macOS operations (tab switching, tab bar
     /// visibility changes) can reset the titlebar appearance.
     private var lastSurfaceConfig: Ghostty.SurfaceView.DerivedConfig?
-    
+
     /// KVO observation for tab group window changes.
+    private weak var observedTabGroup: NSWindowTabGroup?
     private var tabGroupWindowsObservation: NSKeyValueObservation?
     private var tabBarVisibleObservation: NSKeyValueObservation?
-    
+
     deinit {
         tabGroupWindowsObservation?.invalidate()
         tabBarVisibleObservation?.invalidate()
     }
-    
+
     // MARK: NSWindow
 
     override func awakeFromNib() {
@@ -29,7 +30,7 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
 
     override func becomeMain() {
         super.becomeMain()
-        
+
         guard let lastSurfaceConfig else { return }
         syncAppearance(lastSurfaceConfig)
 
@@ -42,7 +43,7 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
             }
         }
     }
-    
+
     override func update() {
         super.update()
 
@@ -67,7 +68,7 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         // Save our config in case we need to reapply
         lastSurfaceConfig = surfaceConfig
 
-        // Everytime we change appearance, set KVO up again in case any of our
+        // Every time we change appearance, set KVO up again in case any of our
         // references changed (e.g. tabGroup is new).
         setupKVO()
 
@@ -88,27 +89,51 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         // color of the titlebar in native fullscreen view.
         if let titlebarView = titlebarContainer?.firstDescendant(withClassName: "NSTitlebarView") {
             titlebarView.wantsLayer = true
-            titlebarView.layer?.backgroundColor = preferredBackgroundColor?.cgColor
+
+            // For glass background styles, use a transparent titlebar to let the glass effect show through
+            // Only apply this for transparent and tabs titlebar styles
+            let isGlassStyle = derivedConfig.backgroundBlur.isGlassStyle
+            let isTransparentTitlebar = derivedConfig.macosTitlebarStyle == .transparent ||
+            derivedConfig.macosTitlebarStyle == .tabs
+
+            titlebarView.layer?.backgroundColor = (isGlassStyle && isTransparentTitlebar)
+                ? NSColor.clear.cgColor
+                : preferredBackgroundColor?.cgColor
         }
-    
+
         // In all cases, we have to hide the background view since this has multiple subviews
         // that force a background color.
         titlebarBackgroundView?.isHidden = true
+
+        if #available(macOS 27.0, *) {
+            // Add some delay to cover the cases where:
+            // 1. AppKit resets the style after exiting fullscreen
+            // 2. AppKit resets the style after adding a new tab
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
+                self?.reduceTabBarBackgroundGoldenGate()
+            }
+        }
+
     }
 
     @available(macOS 13.0, *)
     private func syncAppearanceVentura(_ surfaceConfig: Ghostty.SurfaceView.DerivedConfig) {
         guard let titlebarContainer else { return }
-        
+
         // Setup the titlebar background color to match ours
         titlebarContainer.wantsLayer = true
         titlebarContainer.layer?.backgroundColor = preferredBackgroundColor?.cgColor
-        
+
         // See the docs for the function that sets this to true on why
         effectViewIsHidden = false
-        
+
         // Necessary to not draw the border around the title
         titlebarAppearsTransparent = true
+    }
+
+    @available(macOS 27.0, *)
+    final func reduceTabBarBackgroundGoldenGate() {
+        titlebarContainer?.firstDescendant(withClassName: "NSSubduedGlassEffectView")?.subviews.first?.alphaValue = 0.5
     }
 
     // MARK: View Finders
@@ -120,9 +145,27 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
     // MARK: Tab Group Observation
 
     private func setupKVO() {
-        // See the docs for the respective setup functions for why.
-        setupTabGroupObservation()
-        setupTabBarVisibleObservation()
+        // This can run from one of the observation callbacks below. Replacing
+        // an observation before its callback returns leaves the window retained
+        // by AppKit, so always rebind on the next main-queue turn.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+
+            // Recheck because the tab group and observation state may have changed
+            // while this work was waiting on the main queue.
+            let currentTabGroup = self.tabGroup
+            let observationsValid = currentTabGroup == nil || (
+                self.tabGroupWindowsObservation != nil &&
+                self.tabBarVisibleObservation != nil
+            )
+
+            // Keep the existing observations when they already match.
+            guard self.observedTabGroup !== currentTabGroup || !observationsValid else { return }
+
+            self.observedTabGroup = currentTabGroup
+            self.setupTabGroupObservation()
+            self.setupTabBarVisibleObservation()
+        }
     }
 
     /// Monitors the tabGroup windows value for any changes and resyncs the appearance on change.
@@ -132,7 +175,7 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         // Remove existing observation if any
         tabGroupWindowsObservation?.invalidate()
         tabGroupWindowsObservation = nil
-        
+
         // Check if tabGroup is available
         guard let tabGroup else { return }
 
@@ -142,7 +185,7 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         tabGroupWindowsObservation = tabGroup.observe(
             \.windows,
              options: [.new]
-        ) { [weak self] _, change in
+        ) { [weak self] _, _ in
             // NOTE: At one point, I guarded this on only if we went from 0 to N
             // or N to 0 under the assumption that the tab bar would only get
             // replaced on those cases. This turned out to be false (Tahoe).
@@ -161,29 +204,29 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         // Remove existing observation if any
         tabBarVisibleObservation?.invalidate()
         tabBarVisibleObservation = nil
-        
+
         // Set up KVO observation for isTabBarVisible
         tabBarVisibleObservation = tabGroup?.observe(
             \.isTabBarVisible,
              options: [.new]
-        ) { [weak self] _, change in
+        ) { [weak self] _, _ in
             guard let self else { return }
             guard let lastSurfaceConfig else { return }
             self.syncAppearance(lastSurfaceConfig)
         }
     }
-    
+
     // MARK: macOS 13 to 15
-    
+
     // We only need to set this once, but need to do it after the window has been created in order
     // to determine if the theme is using a very dark background, in which case we don't want to
     // remove the effect view if the default tab bar is being used since the effect created in
     // `updateTabsForVeryDarkBackgrounds` creates a confusing visual design.
     private var effectViewIsHidden = false
-    
+
     private func hideEffectView() {
         guard !effectViewIsHidden else { return }
-        
+
         // By hiding the visual effect view, we allow the window's (or titlebar's in this case)
         // background color to show through. If we were to set `titlebarAppearsTransparent` to true
         // the selected tab would look fine, but the unselected ones and new tab button backgrounds

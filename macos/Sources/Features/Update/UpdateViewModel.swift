@@ -4,7 +4,7 @@ import Sparkle
 
 class UpdateViewModel: ObservableObject {
     @Published var state: UpdateState = .idle
-    
+
     /// The text to display for the current update state.
     /// Returns an empty string for idle state, progress percentages for downloading/extracting,
     /// or descriptive text for other states.
@@ -30,17 +30,15 @@ class UpdateViewModel: ObservableObject {
             return "Downloading…"
         case .extracting(let extracting):
             return String(format: "Preparing: %.0f%%", extracting.progress * 100)
-        case .readyToInstall:
-            return "Ready to Install Update"
-        case .installing:
-            return "Restart to Complete Update"
+        case let .installing(install):
+            return install.appcastItem != nil ? "Restart to Complete Update" : "Installing…"
         case .notFound:
             return "No Updates Available"
         case .error(let err):
             return err.error.localizedDescription
         }
     }
-    
+
     /// The maximum width text for states that show progress.
     /// Used to prevent the pill from resizing as percentages change.
     var maxWidthText: String {
@@ -53,7 +51,7 @@ class UpdateViewModel: ObservableObject {
             return text
         }
     }
-    
+
     /// The SF Symbol icon name for the current update state.
     var iconName: String? {
         switch state {
@@ -69,8 +67,6 @@ class UpdateViewModel: ObservableObject {
             return "arrow.down.circle"
         case .extracting:
             return "shippingbox"
-        case .readyToInstall:
-            return "restart.circle.fill"
         case .installing:
             return "power.circle"
         case .notFound:
@@ -79,7 +75,7 @@ class UpdateViewModel: ObservableObject {
             return "exclamationmark.triangle.fill"
         }
     }
-    
+
     /// A longer description for the current update state.
     /// Used in contexts like the command palette where more detail is helpful.
     var description: String {
@@ -96,17 +92,19 @@ class UpdateViewModel: ObservableObject {
             return "Downloading the update package"
         case .extracting:
             return "Extracting and preparing the update"
-        case .readyToInstall:
-            return "Update is ready to install"
-        case .installing:
-            return "Installing update and preparing to restart"
+        case let .installing(install):
+            if let item = install.appcastItem {
+                return "The update is ready. Version: \(item.displayVersionString)"
+            } else {
+                return "Installing update and preparing to restart"
+            }
         case .notFound:
             return "You are running the latest version"
         case .error:
             return "An error occurred during the update process"
         }
     }
-    
+
     /// A badge to display for the current update state.
     /// Returns version numbers, progress percentages, or nil.
     var badge: String? {
@@ -126,7 +124,7 @@ class UpdateViewModel: ObservableObject {
             return nil
         }
     }
-    
+
     /// The color to apply to the icon for the current update state.
     var iconColor: Color {
         switch state {
@@ -136,7 +134,7 @@ class UpdateViewModel: ObservableObject {
             return .white
         case .checking:
             return .secondary
-        case .updateAvailable, .readyToInstall:
+        case .updateAvailable:
             return .accentColor
         case .downloading, .extracting, .installing:
             return .secondary
@@ -146,7 +144,7 @@ class UpdateViewModel: ObservableObject {
             return .orange
         }
     }
-    
+
     /// The background color for the update pill.
     var backgroundColor: Color {
         switch state {
@@ -154,8 +152,6 @@ class UpdateViewModel: ObservableObject {
             return Color(nsColor: NSColor.systemBlue.blended(withFraction: 0.3, of: .black) ?? .systemBlue)
         case .updateAvailable:
             return .accentColor
-        case .readyToInstall:
-            return Color(nsColor: NSColor.systemGreen.blended(withFraction: 0.3, of: .black) ?? .systemGreen)
         case .notFound:
             return Color(nsColor: NSColor.systemBlue.blended(withFraction: 0.5, of: .black) ?? .systemBlue)
         case .error:
@@ -164,13 +160,13 @@ class UpdateViewModel: ObservableObject {
             return Color(nsColor: .controlBackgroundColor)
         }
     }
-    
+
     /// The foreground (text) color for the update pill.
     var foregroundColor: Color {
         switch state {
         case .permissionRequest:
             return .white
-        case .updateAvailable, .readyToInstall:
+        case .updateAvailable:
             return .white
         case .notFound:
             return .white
@@ -191,63 +187,92 @@ enum UpdateState: Equatable {
     case error(Error)
     case downloading(Downloading)
     case extracting(Extracting)
-    case readyToInstall(ReadyToInstall)
     case installing(Installing)
-    
-    var isIdle: Bool {
+
+    /// True if we're installing an update triggered manually.
+    var shouldTerminateWithoutWarning: Bool {
+        if case .installing(let installing) = self {
+            return installing.appcastItem == nil
+        } else {
+            return false
+        }
+    }
+
+    var isHidden: Bool {
         if case .idle = self { return true }
+        if case .installing(let installing) = self {
+            // Hide the update pill when installing is triggered by auto update.
+            // There will be an alert when users check the updates themselves.
+            return installing.appcastItem != nil
+        }
         return false
     }
-    
+
     /// This is true if we're in a state that can be force installed. 
     var isInstallable: Bool {
-        switch (self) {
+        switch self {
         case .checking,
                 .updateAvailable,
                 .downloading,
                 .extracting,
-                .readyToInstall,
                 .installing:
             return true
-            
+
         default:
             return false
         }
     }
-    
+
+    var isCancellable: Bool {
+        cancelAction != nil
+    }
+
     func cancel() {
+        cancelAction?()
+    }
+
+    private var cancelAction: (() -> Void)? {
         switch self {
+        case .idle:
+            nil
+        case .permissionRequest:
+            nil
         case .checking(let checking):
-            checking.cancel()
+            checking.cancel
         case .updateAvailable(let available):
-            available.reply(.dismiss)
+            { available.reply(.dismiss) }
         case .downloading(let downloading):
-            downloading.cancel()
-        case .readyToInstall(let ready):
-            ready.reply(.dismiss)
+            downloading.cancel
         case .notFound(let notFound):
-            notFound.acknowledgement()
+            notFound.acknowledgement
         case .error(let err):
-            err.dismiss()
-        default:
-            break
+            err.dismiss
+        case .extracting:
+            nil
+        case .installing:
+            nil
         }
     }
-    
+
     /// Confirms or accepts the current update state.
     /// - For available updates: begins installation
     /// - For ready-to-install: proceeds with installation
-    func confirm() {
+    /// - For installing: suppress termination warnings and restart
+    mutating func confirm() {
         switch self {
         case .updateAvailable(let available):
             available.reply(.install)
-        case .readyToInstall(let ready):
-            ready.reply(.install)
+        case .installing(let installing):
+            // Remove appcastItem so we can restart without any other alerts.
+            var suppressTerminationWarnings = installing
+            suppressTerminationWarnings.appcastItem = nil
+            self = .installing(suppressTerminationWarnings)
+            installing.retryTerminatingApplication()
         default:
             break
         }
     }
-    
+
     static func == (lhs: UpdateState, rhs: UpdateState) -> Bool {
         switch (lhs, rhs) {
         case (.idle, .idle):
@@ -266,46 +291,44 @@ enum UpdateState: Equatable {
             return lDown.progress == rDown.progress && lDown.expectedLength == rDown.expectedLength
         case (.extracting(let lExt), .extracting(let rExt)):
             return lExt.progress == rExt.progress
-        case (.readyToInstall, .readyToInstall):
-            return true
-        case (.installing, .installing):
-            return true
+        case (.installing(let lhs), .installing(let rhs)):
+            return lhs.appcastItem?.displayVersionString == rhs.appcastItem?.displayVersionString
         default:
             return false
         }
     }
-    
+
     struct NotFound {
         let acknowledgement: () -> Void
     }
-    
+
     struct PermissionRequest {
         let request: SPUUpdatePermissionRequest
         let reply: @Sendable (SUUpdatePermissionResponse) -> Void
     }
-    
+
     struct Checking {
         let cancel: () -> Void
     }
-    
+
     struct UpdateAvailable {
         let appcastItem: SUAppcastItem
         let reply: @Sendable (SPUUserUpdateChoice) -> Void
-        
+
         var releaseNotes: ReleaseNotes? {
             let currentCommit = Bundle.main.infoDictionary?["GhosttyCommit"] as? String
             return ReleaseNotes(displayVersionString: appcastItem.displayVersionString, currentCommit: currentCommit)
         }
     }
-    
+
     enum ReleaseNotes {
         case commit(URL)
         case compareTip(URL)
         case tagged(URL)
-        
+
         init?(displayVersionString: String, currentCommit: String?) {
             let version = displayVersionString
-            
+
             // Check for semantic version (x.y.z)
             if let semver = Self.extractSemanticVersion(from: version) {
                 let slug = semver.replacingOccurrences(of: ".", with: "-")
@@ -314,12 +337,12 @@ enum UpdateState: Equatable {
                     return
                 }
             }
-            
+
             // Fall back to git hash detection
             guard let newHash = Self.extractGitHash(from: version) else {
                 return nil
             }
-            
+
             if let currentHash = currentCommit, !currentHash.isEmpty,
                let url = URL(string: "https://github.com/ghostty-org/ghostty/compare/\(currentHash)...\(newHash)") {
                 self = .compareTip(url)
@@ -329,7 +352,7 @@ enum UpdateState: Equatable {
                 return nil
             }
         }
-        
+
         private static func extractSemanticVersion(from version: String) -> String? {
             let pattern = #"^\d+\.\d+\.\d+$"#
             if version.range(of: pattern, options: .regularExpression) != nil {
@@ -337,7 +360,7 @@ enum UpdateState: Equatable {
             }
             return nil
         }
-        
+
         private static func extractGitHash(from version: String) -> String? {
             let pattern = #"[0-9a-f]{7,40}"#
             if let range = version.range(of: pattern, options: .regularExpression) {
@@ -345,7 +368,7 @@ enum UpdateState: Equatable {
             }
             return nil
         }
-        
+
         var url: URL {
             switch self {
             case .commit(let url): return url
@@ -353,37 +376,41 @@ enum UpdateState: Equatable {
             case .tagged(let url): return url
             }
         }
-        
+
         var label: String {
-            switch (self) {
+            switch self {
             case .commit: return "View GitHub Commit"
             case .compareTip: return "Changes Since This Tip Release"
             case .tagged: return "View Release Notes"
             }
         }
     }
-    
+
     struct Error {
         let error: any Swift.Error
         let retry: () -> Void
         let dismiss: () -> Void
     }
-    
+
     struct Downloading {
         let cancel: () -> Void
         let expectedLength: UInt64?
         let progress: UInt64
     }
-    
+
     struct Extracting {
         let progress: Double
     }
-    
-    struct ReadyToInstall {
-        let reply: @Sendable (SPUUserUpdateChoice) -> Void
-    }
-    
+
     struct Installing {
+        /// Non-nil if this state is triggered by auto update
+        var appcastItem: SUAppcastItem?
         let retryTerminatingApplication: () -> Void
+
+        var releaseNotes: ReleaseNotes? {
+            guard let appcastItem else { return nil }
+            let currentCommit = Bundle.main.infoDictionary?["GhosttyCommit"] as? String
+            return ReleaseNotes(displayVersionString: appcastItem.displayVersionString, currentCommit: currentCommit)
+        }
     }
 }

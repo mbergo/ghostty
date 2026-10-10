@@ -5,8 +5,6 @@
 const Parser = @This();
 
 const std = @import("std");
-const builtin = @import("builtin");
-const assert = std.debug.assert;
 const testing = std.testing;
 const table = @import("parse_table.zig").table;
 const osc = @import("osc.zig");
@@ -168,12 +166,18 @@ pub const Action = union(enum) {
                         // of invisible characters we don't want to handle right
                         // now.
 
-                        // All others do the default behavior
+                        // All others do the default behavior. Note the max
+                        // depth of 1: this is only used for logging so we
+                        // only want the top-level fields. Larger depths
+                        // instantiate a recursive formatter for every nested
+                        // type of every action payload (e.g. the full
+                        // osc.Command union), which costs tens of kilobytes
+                        // of binary size.
                         else => try writer.printValue(
                             "any",
                             .{},
                             @field(self, u_field.name),
-                            3,
+                            1,
                         ),
                     }
                 }
@@ -291,6 +295,8 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
                 break :osc_string null;
             },
             .dcs_passthrough => dcs_hook: {
+                // Ignore too many parameters
+                if (self.params_idx >= MAX_PARAMS) break :dcs_hook null;
                 // Finalize parameters
                 if (self.param_acc_idx > 0) {
                     self.params[self.params_idx] = self.param_acc;
@@ -312,6 +318,7 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
 
 pub inline fn collect(self: *Parser, c: u8) void {
     if (self.intermediates_idx >= MAX_INTERMEDIATE) {
+        @branchHint(.cold);
         log.warn("invalid intermediates count", .{});
         return;
     }
@@ -348,9 +355,7 @@ inline fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
             }
 
             // A numeric value. Add it to our accumulator.
-            if (self.param_acc_idx > 0) {
-                self.param_acc *|= 10;
-            }
+            self.param_acc *|= 10;
             self.param_acc +|= c - '0';
 
             // Increment our accumulator index. If we overflow then
@@ -362,7 +367,7 @@ inline fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
             break :param null;
         },
         .osc_put => osc_put: {
-            self.osc_parser.next(c);
+            @call(.always_inline, osc.Parser.next, .{ &self.osc_parser, c });
             break :osc_put null;
         },
         .csi_dispatch => csi_dispatch: {
@@ -386,10 +391,8 @@ inline fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
 
             // We only allow colon or mixed separators for the 'm' command.
             if (c != 'm' and self.params_sep.count() > 0) {
-                log.warn(
-                    "CSI colon or mixed separators only allowed for 'm' command, got: {f}",
-                    .{result},
-                );
+                @branchHint(.cold);
+                warnCsiSepMismatch(result.csi_dispatch);
                 break :csi_dispatch null;
             }
 
@@ -404,6 +407,20 @@ inline fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
         .put => Action{ .dcs_put = c },
         .apc_put => Action{ .apc_put = c },
     };
+}
+
+/// Log a warning for a CSI dispatch with colon/mixed separators on a
+/// non-'m' command.
+///
+/// This is noinline on purpose so that this unlikely (cold) behavior
+/// doesn't bloat the hot dispatch path which has been measured to actually
+/// affect both binary size and performance due to icache busts.
+noinline fn warnCsiSepMismatch(csi: Action.CSI) void {
+    @branchHint(.cold);
+    log.warn(
+        "CSI colon or mixed separators only allowed for 'm' command, got: {f}",
+        .{csi},
+    );
 }
 
 pub inline fn clear(self: *Parser) void {
@@ -958,6 +975,18 @@ test "osc: 104 empty" {
     }
 }
 
+test "osc: 105 empty" {
+    var p: Parser = init();
+    defer p.deinit();
+    p.osc_parser.alloc = std.testing.allocator;
+
+    for ("\x1b]105") |c| _ = p.next(c);
+
+    const cmd = p.next(0x07)[0].?.osc_dispatch;
+    try testing.expect(cmd == .color_operation);
+    try testing.expect(cmd.color_operation.op == .osc_105);
+}
+
 test "csi: too many params" {
     var p = init();
     _ = p.next(0x1B);
@@ -1071,4 +1100,29 @@ test "dcs: params" {
         try testing.expectEqualSlices(u16, &[_]u16{1000}, hook.params);
         try testing.expectEqual('p', hook.final);
     }
+}
+
+test "dcs: too many params" {
+    // Regression test for a crash found by fuzzing (afl). When a DCS
+    // sequence has more than MAX_PARAMS parameters and param_acc_idx > 0,
+    // entering dcs_passthrough wrote to params[params_idx] without a
+    // bounds check, causing an out-of-bounds access.
+    var p = init();
+    _ = p.next(0x1B); // ESC
+    _ = p.next('P'); // DCS entry
+
+    // Feed a digit then MAX_PARAMS semicolons to fill all param slots.
+    _ = p.next('6');
+    for (0..MAX_PARAMS) |_| {
+        _ = p.next(';');
+    }
+    // Feed another digit so param_acc_idx > 0 while params_idx == MAX_PARAMS.
+    _ = p.next('7');
+
+    // A final byte triggers entry to dcs_passthrough. The DCS should
+    // be dropped entirely, consistent with how CSI handles overflow.
+    const a = p.next('p');
+    try testing.expect(a[0] == null);
+    try testing.expect(a[1] == null);
+    try testing.expect(a[2] == null);
 }

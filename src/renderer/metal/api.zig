@@ -43,9 +43,7 @@ pub const MTLResourceOptions = packed struct(c_ulong) {
     /// https://developer.apple.com/documentation/metal/mtlhazardtrackingmode?language=objc
     hazard_tracking_mode: HazardTrackingMode = .default,
 
-    _pad: @Type(.{
-        .int = .{ .signedness = .unsigned, .bits = @bitSizeOf(c_ulong) - 10 },
-    }) = 0,
+    _pad: @Int(.unsigned, @bitSizeOf(c_ulong) - 10) = 0,
 
     pub const CPUCacheMode = enum(u4) {
         default = 0,
@@ -366,10 +364,7 @@ pub const MTLTextureUsage = packed struct(c_ulong) {
     /// https://developer.apple.com/documentation/metal/mtltextureusage/shaderatomic?language=objc
     shader_atomic: bool = false, // TextureUsageShaderAtomic = 32,
 
-    __reserved: @Type(.{ .int = .{
-        .signedness = .unsigned,
-        .bits = @bitSizeOf(c_ulong) - 6,
-    } }) = 0,
+    __reserved: @Int(.unsigned, @bitSizeOf(c_ulong) - 6) = 0,
 
     /// https://developer.apple.com/documentation/metal/mtltextureusage/unknown?language=objc
     const unknown: MTLTextureUsage = @bitCast(0); // TextureUsageUnknown = 0,
@@ -389,6 +384,27 @@ pub const MTLRenderStage = enum(c_ulong) {
     tile = 4,
     object = 8,
     mesh = 16,
+};
+
+/// https://developer.apple.com/documentation/metal/mtlgpufamily?language=objc
+pub const MTLGPUFamily = enum(c_long) {
+    apple1 = 1001,
+    apple2 = 1002,
+    apple3 = 1003,
+    apple4 = 1004,
+    apple5 = 1005,
+    apple6 = 1006,
+    apple7 = 1007,
+    apple8 = 1008,
+    apple9 = 1009,
+    apple10 = 1010,
+
+    common1 = 3001,
+    common2 = 3002,
+    common3 = 3003,
+
+    metal3 = 5001,
+    metal4 = 5002,
 };
 
 pub const MTLClearColor = extern struct {

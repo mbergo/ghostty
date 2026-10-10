@@ -2,7 +2,7 @@
 //! Kitty graphics protocol unicode placeholder, virtual placement feature.
 
 const std = @import("std");
-const assert = std.debug.assert;
+const assert = @import("../../quirks.zig").inlineAssert;
 const testing = std.testing;
 const terminal = @import("../main.zig");
 const kitty_gfx = terminal.kitty.graphics;
@@ -256,7 +256,7 @@ pub const Placement = struct {
             if (img_scale_source.y < img_scaled.y_offset) {
                 // If our source rect y is within the offset area, we need to
                 // adjust our source rect and destination since the source texture
-                // doesnt actually have the offset area blank.
+                // doesn't actually have the offset area blank.
                 const offset: f64 = img_scaled.y_offset - img_scale_source.y;
                 img_scale_source.height -= offset;
                 y_offset = offset;
@@ -286,7 +286,7 @@ pub const Placement = struct {
             if (img_scale_source.x < img_scaled.x_offset) {
                 // If our source rect x is within the offset area, we need to
                 // adjust our source rect and destination since the source texture
-                // doesnt actually have the offset area blank.
+                // doesn't actually have the offset area blank.
                 const offset: f64 = img_scaled.x_offset - img_scale_source.x;
                 img_scale_source.width -= offset;
                 x_offset = offset;
@@ -363,29 +363,17 @@ pub const Placement = struct {
         image: *const Image,
         cell_width: u32,
         cell_height: u32,
-    ) !struct {
+    ) Error!struct {
         rows: u32,
         columns: u32,
     } {
         // Get the placement. If an ID is specified we look for the exact one.
         // If no ID, then we find the first virtual placement for this image.
-        const placement = if (self.placement_id > 0) storage.placements.get(.{
-            .image_id = self.image_id,
-            .placement_id = .{ .tag = .external, .id = self.placement_id },
-        }) orelse {
-            return Error.PlacementMissingPlacement;
-        } else placement: {
-            var it = storage.placements.iterator();
-            while (it.next()) |entry| {
-                if (entry.key_ptr.image_id == self.image_id and
-                    entry.value_ptr.location == .virtual)
-                {
-                    break :placement entry.value_ptr.*;
-                }
-            }
-
-            return Error.PlacementMissingPlacement;
-        };
+        const target = storage.placeholderTarget(
+            self.image_id,
+            self.placement_id,
+        ) orelse return Error.PlacementMissingPlacement;
+        const placement = target.placement;
 
         // Use requested rows/columns if specified
         // For unspecified rows/columns, calculate based on the image size.
@@ -885,7 +873,8 @@ test "unicode diacritic" {
 
 test "unicode placement: none" {
     const alloc = testing.allocator;
-    var t = try terminal.Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
     t.modes.set(.grapheme_cluster, true);
 
@@ -893,14 +882,15 @@ test "unicode placement: none" {
     try t.printString("hello\nworld\n1\n2");
 
     // No placements
-    const pin = t.screen.pages.getTopLeft(.viewport);
+    const pin = t.screens.active.pages.getTopLeft(.viewport);
     var it = placementIterator(pin, null);
     try testing.expect(it.next() == null);
 }
 
 test "unicode placement: single row/col" {
     const alloc = testing.allocator;
-    var t = try terminal.Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
     t.modes.set(.grapheme_cluster, true);
 
@@ -908,7 +898,7 @@ test "unicode placement: single row/col" {
     try t.printString("\u{10EEEE}\u{0305}\u{0305}");
 
     // Get our top left pin
-    const pin = t.screen.pages.getTopLeft(.viewport);
+    const pin = t.screens.active.pages.getTopLeft(.viewport);
 
     // Should have exactly one placement
     var it = placementIterator(pin, null);
@@ -924,7 +914,8 @@ test "unicode placement: single row/col" {
 
 test "unicode placement: continuation break" {
     const alloc = testing.allocator;
-    var t = try terminal.Terminal.init(alloc, .{ .rows = 5, .cols = 10 });
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 10 });
     defer t.deinit(alloc);
     t.modes.set(.grapheme_cluster, true);
 
@@ -933,7 +924,7 @@ test "unicode placement: continuation break" {
     try t.printString("\u{10EEEE}\u{0305}\u{030E}");
 
     // Get our top left pin
-    const pin = t.screen.pages.getTopLeft(.viewport);
+    const pin = t.screens.active.pages.getTopLeft(.viewport);
 
     // Should have exactly one placement
     var it = placementIterator(pin, null);
@@ -958,7 +949,8 @@ test "unicode placement: continuation break" {
 
 test "unicode placement: continuation with diacritics set" {
     const alloc = testing.allocator;
-    var t = try terminal.Terminal.init(alloc, .{ .rows = 5, .cols = 10 });
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 10 });
     defer t.deinit(alloc);
     t.modes.set(.grapheme_cluster, true);
 
@@ -968,7 +960,7 @@ test "unicode placement: continuation with diacritics set" {
     try t.printString("\u{10EEEE}\u{0305}\u{030E}");
 
     // Get our top left pin
-    const pin = t.screen.pages.getTopLeft(.viewport);
+    const pin = t.screens.active.pages.getTopLeft(.viewport);
 
     // Should have exactly one placement
     var it = placementIterator(pin, null);
@@ -985,7 +977,8 @@ test "unicode placement: continuation with diacritics set" {
 
 test "unicode placement: continuation with no col" {
     const alloc = testing.allocator;
-    var t = try terminal.Terminal.init(alloc, .{ .rows = 5, .cols = 10 });
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 10 });
     defer t.deinit(alloc);
     t.modes.set(.grapheme_cluster, true);
 
@@ -995,7 +988,7 @@ test "unicode placement: continuation with no col" {
     try t.printString("\u{10EEEE}\u{0305}");
 
     // Get our top left pin
-    const pin = t.screen.pages.getTopLeft(.viewport);
+    const pin = t.screens.active.pages.getTopLeft(.viewport);
 
     // Should have exactly one placement
     var it = placementIterator(pin, null);
@@ -1012,7 +1005,8 @@ test "unicode placement: continuation with no col" {
 
 test "unicode placement: continuation with no diacritics" {
     const alloc = testing.allocator;
-    var t = try terminal.Terminal.init(alloc, .{ .rows = 5, .cols = 10 });
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 10 });
     defer t.deinit(alloc);
     t.modes.set(.grapheme_cluster, true);
 
@@ -1022,7 +1016,7 @@ test "unicode placement: continuation with no diacritics" {
     try t.printString("\u{10EEEE}");
 
     // Get our top left pin
-    const pin = t.screen.pages.getTopLeft(.viewport);
+    const pin = t.screens.active.pages.getTopLeft(.viewport);
 
     // Should have exactly one placement
     var it = placementIterator(pin, null);
@@ -1039,7 +1033,8 @@ test "unicode placement: continuation with no diacritics" {
 
 test "unicode placement: run ending" {
     const alloc = testing.allocator;
-    var t = try terminal.Terminal.init(alloc, .{ .rows = 5, .cols = 10 });
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 10 });
     defer t.deinit(alloc);
     t.modes.set(.grapheme_cluster, true);
 
@@ -1049,7 +1044,7 @@ test "unicode placement: run ending" {
     try t.printString("ABC");
 
     // Get our top left pin
-    const pin = t.screen.pages.getTopLeft(.viewport);
+    const pin = t.screens.active.pages.getTopLeft(.viewport);
 
     // Should have exactly one placement
     var it = placementIterator(pin, null);
@@ -1066,7 +1061,8 @@ test "unicode placement: run ending" {
 
 test "unicode placement: run starting in the middle" {
     const alloc = testing.allocator;
-    var t = try terminal.Terminal.init(alloc, .{ .rows = 5, .cols = 10 });
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 10 });
     defer t.deinit(alloc);
     t.modes.set(.grapheme_cluster, true);
 
@@ -1076,7 +1072,7 @@ test "unicode placement: run starting in the middle" {
     try t.printString("\u{10EEEE}\u{0305}\u{030D}");
 
     // Get our top left pin
-    const pin = t.screen.pages.getTopLeft(.viewport);
+    const pin = t.screens.active.pages.getTopLeft(.viewport);
 
     // Should have exactly one placement
     var it = placementIterator(pin, null);
@@ -1093,7 +1089,8 @@ test "unicode placement: run starting in the middle" {
 
 test "unicode placement: specifying image id as palette" {
     const alloc = testing.allocator;
-    var t = try terminal.Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
     t.modes.set(.grapheme_cluster, true);
 
@@ -1102,7 +1099,7 @@ test "unicode placement: specifying image id as palette" {
     try t.printString("\u{10EEEE}\u{0305}\u{0305}");
 
     // Get our top left pin
-    const pin = t.screen.pages.getTopLeft(.viewport);
+    const pin = t.screens.active.pages.getTopLeft(.viewport);
 
     // Should have exactly one placement
     var it = placementIterator(pin, null);
@@ -1118,7 +1115,8 @@ test "unicode placement: specifying image id as palette" {
 
 test "unicode placement: specifying image id with high bits" {
     const alloc = testing.allocator;
-    var t = try terminal.Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
     t.modes.set(.grapheme_cluster, true);
 
@@ -1127,7 +1125,7 @@ test "unicode placement: specifying image id with high bits" {
     try t.printString("\u{10EEEE}\u{0305}\u{0305}\u{030E}");
 
     // Get our top left pin
-    const pin = t.screen.pages.getTopLeft(.viewport);
+    const pin = t.screens.active.pages.getTopLeft(.viewport);
 
     // Should have exactly one placement
     var it = placementIterator(pin, null);
@@ -1143,7 +1141,8 @@ test "unicode placement: specifying image id with high bits" {
 
 test "unicode placement: specifying placement id as palette" {
     const alloc = testing.allocator;
-    var t = try terminal.Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
     t.modes.set(.grapheme_cluster, true);
 
@@ -1153,7 +1152,7 @@ test "unicode placement: specifying placement id as palette" {
     try t.printString("\u{10EEEE}\u{0305}\u{0305}");
 
     // Get our top left pin
-    const pin = t.screen.pages.getTopLeft(.viewport);
+    const pin = t.screens.active.pages.getTopLeft(.viewport);
 
     // Should have exactly one placement
     var it = placementIterator(pin, null);
@@ -1174,17 +1173,18 @@ test "unicode placement: specifying placement id as palette" {
 // printf "\033_Ga=p,i=1,U=1,q=2,c=4,r=2\033\\"
 test "unicode render placement: dog 4x2" {
     const alloc = testing.allocator;
+    const io = testing.io;
     const cell_width = 36;
     const cell_height = 80;
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 100, .rows = 100 });
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 100, .rows = 100 });
     defer t.deinit(alloc);
     var s: ImageStorage = .{};
-    defer s.deinit(alloc, &t.screen);
+    defer s.deinit(alloc, t.screens.active);
 
     const image: Image = .{ .id = 1, .width = 500, .height = 306 };
-    try s.addImage(alloc, image);
-    try s.addPlacement(alloc, 1, 0, .{
+    try s.addImage(io, alloc, t.screens.active, image);
+    try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
         .location = .{ .virtual = {} },
         .columns = 4,
         .rows = 2,
@@ -1193,7 +1193,7 @@ test "unicode render placement: dog 4x2" {
     // Row 1
     {
         const p: Placement = .{
-            .pin = t.screen.cursor.page_pin.*,
+            .pin = t.screens.active.cursor.page_pin.*,
             .image_id = 1,
             .placement_id = 0,
             .col = 0,
@@ -1214,7 +1214,7 @@ test "unicode render placement: dog 4x2" {
     // Row 2
     {
         const p: Placement = .{
-            .pin = t.screen.cursor.page_pin.*,
+            .pin = t.screens.active.cursor.page_pin.*,
             .image_id = 1,
             .placement_id = 0,
             .col = 0,
@@ -1241,17 +1241,18 @@ test "unicode render placement: dog 4x2" {
 // printf "\033_Ga=p,i=1,U=1,q=2,c=2,r=2\033\\"
 test "unicode render placement: dog 2x2 with blank cells" {
     const alloc = testing.allocator;
+    const io = testing.io;
     const cell_width = 36;
     const cell_height = 80;
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 100, .rows = 100 });
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 100, .rows = 100 });
     defer t.deinit(alloc);
     var s: ImageStorage = .{};
-    defer s.deinit(alloc, &t.screen);
+    defer s.deinit(alloc, t.screens.active);
 
     const image: Image = .{ .id = 1, .width = 500, .height = 306 };
-    try s.addImage(alloc, image);
-    try s.addPlacement(alloc, 1, 0, .{
+    try s.addImage(io, alloc, t.screens.active, image);
+    try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
         .location = .{ .virtual = {} },
         .columns = 2,
         .rows = 2,
@@ -1260,7 +1261,7 @@ test "unicode render placement: dog 2x2 with blank cells" {
     // Row 1
     {
         const p: Placement = .{
-            .pin = t.screen.cursor.page_pin.*,
+            .pin = t.screens.active.cursor.page_pin.*,
             .image_id = 1,
             .placement_id = 0,
             .col = 0,
@@ -1281,7 +1282,7 @@ test "unicode render placement: dog 2x2 with blank cells" {
     // Row 2
     {
         const p: Placement = .{
-            .pin = t.screen.cursor.page_pin.*,
+            .pin = t.screens.active.cursor.page_pin.*,
             .image_id = 1,
             .placement_id = 0,
             .col = 0,
@@ -1307,17 +1308,18 @@ test "unicode render placement: dog 2x2 with blank cells" {
 // printf "\033_Ga=p,i=1,U=1,q=2,c=1,r=1\033\\"
 test "unicode render placement: dog 1x1" {
     const alloc = testing.allocator;
+    const io = testing.io;
     const cell_width = 36;
     const cell_height = 80;
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 100, .rows = 100 });
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 100, .rows = 100 });
     defer t.deinit(alloc);
     var s: ImageStorage = .{};
-    defer s.deinit(alloc, &t.screen);
+    defer s.deinit(alloc, t.screens.active);
 
     const image: Image = .{ .id = 1, .width = 500, .height = 306 };
-    try s.addImage(alloc, image);
-    try s.addPlacement(alloc, 1, 0, .{
+    try s.addImage(io, alloc, t.screens.active, image);
+    try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
         .location = .{ .virtual = {} },
         .columns = 1,
         .rows = 1,
@@ -1326,7 +1328,7 @@ test "unicode render placement: dog 1x1" {
     // Row 1
     {
         const p: Placement = .{
-            .pin = t.screen.cursor.page_pin.*,
+            .pin = t.screens.active.cursor.page_pin.*,
             .image_id = 1,
             .placement_id = 0,
             .col = 0,

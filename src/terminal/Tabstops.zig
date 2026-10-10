@@ -10,10 +10,10 @@
 const Tabstops = @This();
 
 const std = @import("std");
+const tripwire = @import("../tripwire.zig");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
-const assert = std.debug.assert;
-const fastmem = @import("../fastmem.zig");
+const assert = @import("../quirks.zig").inlineAssert;
 
 /// Unit is the type we use per tabstop unit (see file docs).
 const Unit = u8;
@@ -58,7 +58,11 @@ inline fn index(col: usize) usize {
     return @mod(col, unit_bits);
 }
 
-pub fn init(alloc: Allocator, cols: usize, interval: usize) !Tabstops {
+pub fn init(
+    alloc: Allocator,
+    cols: usize,
+    interval: usize,
+) Allocator.Error!Tabstops {
     var res: Tabstops = .{};
     try res.resize(alloc, cols);
     res.reset(interval);
@@ -89,13 +93,13 @@ pub fn unset(self: *Tabstops, col: usize) void {
     const i = entry(col);
     const idx = index(col);
     if (i < prealloc_count) {
-        self.prealloc_stops[i] ^= masks[idx];
+        self.prealloc_stops[i] &= ~masks[idx];
         return;
     }
 
     const dynamic_i = i - prealloc_count;
     assert(dynamic_i < self.dynamic_stops.len);
-    self.dynamic_stops[dynamic_i] ^= masks[idx];
+    self.dynamic_stops[dynamic_i] &= ~masks[idx];
 }
 
 /// Get the value of a tabstop at a specific column. The columns are 0-indexed.
@@ -114,28 +118,41 @@ pub fn get(self: Tabstops, col: usize) bool {
     return unit & mask == mask;
 }
 
+const resize_tw = tripwire.module(enum {
+    dynamic_alloc,
+}, resize);
+
 /// Resize this to support up to cols columns.
 // TODO: needs interval to set new tabstops
-pub fn resize(self: *Tabstops, alloc: Allocator, cols: usize) !void {
-    // Set our new value
-    self.cols = cols;
+pub fn resize(
+    self: *Tabstops,
+    alloc: Allocator,
+    cols: usize,
+) Allocator.Error!void {
+    const tw = resize_tw;
 
     // Do nothing if it fits.
-    if (cols <= prealloc_columns) return;
-
-    // What we need in the dynamic size
-    const size = cols - prealloc_columns;
-    if (size < self.dynamic_stops.len) return;
-
-    // Note: we can probably try to realloc here but I'm not sure it matters.
-    const new = try alloc.alloc(Unit, size);
-    @memset(new, 0);
-    if (self.dynamic_stops.len > 0) {
-        fastmem.copy(Unit, new, self.dynamic_stops);
-        alloc.free(self.dynamic_stops);
+    if (cols <= prealloc_columns) {
+        self.cols = cols;
+        return;
     }
 
-    self.dynamic_stops = new;
+    // Number of units needed beyond the preallocated columns.
+    const dynamic_count = std.math.divCeil(
+        usize,
+        cols - prealloc_columns,
+        unit_bits,
+    ) catch unreachable;
+    if (dynamic_count <= self.dynamic_stops.len) {
+        self.cols = cols;
+        return;
+    }
+
+    try tw.check(.dynamic_alloc);
+    const old_len = self.dynamic_stops.len;
+    self.dynamic_stops = try alloc.realloc(self.dynamic_stops, dynamic_count);
+    @memset(self.dynamic_stops[old_len..], 0);
+    self.cols = cols;
 }
 
 /// Return the maximum number of columns this can support currently.
@@ -149,11 +166,11 @@ pub fn reset(self: *Tabstops, interval: usize) void {
     @memset(&self.prealloc_stops, 0);
     @memset(self.dynamic_stops, 0);
 
-    if (interval > 0) {
-        var i: usize = interval;
-        while (i < self.cols - 1) : (i += interval) {
-            self.set(i);
-        }
+    if (interval == 0 or self.cols <= 1) return;
+
+    var i: usize = interval;
+    while (i < self.cols - 1) : (i += interval) {
+        self.set(i);
     }
 }
 
@@ -181,23 +198,46 @@ test "Tabstops: basic" {
     try testing.expect(t.get(4));
     t.unset(4);
     try testing.expect(!t.get(4));
+
+    // Unsetting a column with no tabstop should be a no-op, not a toggle.
+    t.unset(4);
+    try testing.expect(!t.get(4));
 }
 
 test "Tabstops: dynamic allocations" {
     var t: Tabstops = .{};
     defer t.deinit(testing.allocator);
 
-    // Grow the capacity by 2.
+    // Grow by less than one unit to verify the allocation rounds up.
     const cap = t.capacity();
-    try t.resize(testing.allocator, cap * 2);
+    try t.resize(testing.allocator, cap + 5);
+    try testing.expectEqual(cap + unit_bits, t.capacity());
 
     // Set something that was out of range of the first
-    t.set(cap + 5);
-    try testing.expect(t.get(cap + 5));
-    try testing.expect(!t.get(cap + 4));
+    t.set(cap + 4);
+    try testing.expect(t.get(cap + 4));
+    try testing.expect(!t.get(cap + 3));
+
+    // Unsetting a column with no tabstop should be a no-op, not a toggle.
+    t.unset(cap + 3);
+    try testing.expect(!t.get(cap + 3));
+
+    // Growing again preserves existing stops and clears the new unit.
+    try t.resize(testing.allocator, cap + unit_bits + 1);
+    try testing.expect(t.get(cap + 4));
+    try testing.expect(!t.get(cap + unit_bits));
 
     // Prealloc still works
     try testing.expect(!t.get(5));
+}
+
+test "Tabstops: resize to existing capacity does not allocate" {
+    var backing: [prealloc_count]Unit = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    var t: Tabstops = .{};
+
+    try t.resize(fixed.allocator(), prealloc_columns * 2);
+    try t.resize(fixed.allocator(), prealloc_columns * 2);
 }
 
 test "Tabstops: interval" {
@@ -207,6 +247,13 @@ test "Tabstops: interval" {
     try testing.expect(t.get(4));
     try testing.expect(!t.get(5));
     try testing.expect(t.get(8));
+}
+
+test "Tabstops: interval with zero columns" {
+    var t: Tabstops = try init(testing.allocator, 0, 8);
+    defer t.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 0), t.cols);
 }
 
 test "Tabstops: count on 80" {
@@ -229,4 +276,22 @@ test "Tabstops: count on 80" {
     };
 
     try testing.expectEqual(@as(usize, 9), count);
+}
+
+test "Tabstops: resize alloc failure preserves state" {
+    // This test verifies that if resize() fails during allocation,
+    // the original cols value is preserved (not corrupted).
+    var t: Tabstops = try init(testing.allocator, 80, 8);
+    defer t.deinit(testing.allocator);
+
+    const original_cols = t.cols;
+
+    // Trigger allocation failure when resizing beyond prealloc
+    resize_tw.errorAlways(.dynamic_alloc, error.OutOfMemory);
+    const result = t.resize(testing.allocator, prealloc_columns * 2);
+    try testing.expectError(error.OutOfMemory, result);
+    try resize_tw.end(.reset);
+
+    // cols should be unchanged after failed resize
+    try testing.expectEqual(original_cols, t.cols);
 }

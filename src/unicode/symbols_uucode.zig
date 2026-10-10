@@ -3,10 +3,8 @@ const uucode = @import("uucode");
 const lut = @import("lut.zig");
 
 /// Runnable binary to generate the lookup tables and output to stdout.
-pub fn main() !void {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const alloc = arena_state.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.arena.allocator();
 
     const gen: lut.Generator(
         bool,
@@ -32,9 +30,12 @@ pub fn main() !void {
     defer alloc.free(t.stage3);
 
     var buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buf);
+    var stdout = std.Io.File.stdout().writer(init.io, &buf);
     try t.writeZig(&stdout.interface);
-    try stdout.end();
+    // Use flush instead of end because stdout is a pipe when captured by
+    // the build system, and pipes cannot be truncated (Windows returns
+    // INVALID_PARAMETER, Linux returns EINVAL).
+    try stdout.interface.flush();
 
     // Uncomment when manually debugging to see our table sizes.
     // std.log.warn("stage1={} stage2={} stage3={}", .{

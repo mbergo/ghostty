@@ -1,10 +1,16 @@
 const std = @import("std");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
 
 pub const scalar_decoder: Base64Decoder = .init(
     std.base64.standard_alphabet_chars,
     null,
 );
+
+/// Whether c is one of the 64 standard base64 alphabet characters
+/// (padding is not part of the alphabet).
+pub fn isAlphabetChar(c: u8) bool {
+    return scalar_decoder.char_to_index[c] != Base64Decoder.invalid_char;
+}
 
 /// Copied from Zig 0.14.1 stdlib and commented out the invalid padding
 /// scenarios, because Kitty Graphics requires a decoder that doesn't care

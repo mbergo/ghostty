@@ -1,10 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const xev = @import("xev");
+const global = @import("../global.zig");
+const xev = global.xev;
 const wuffs = @import("wuffs");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
 const font = @import("../font/main.zig");
+const inputpkg = @import("../input.zig");
 const os = @import("../os/main.zig");
 const terminal = @import("../terminal/main.zig");
 const renderer = @import("../renderer.zig");
@@ -15,16 +17,17 @@ const cellpkg = @import("cell.zig");
 const noMinContrast = cellpkg.noMinContrast;
 const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
+const rowNeverExtendBg = @import("row.zig").neverExtendBg;
+const Overlay = @import("Overlay.zig");
 const imagepkg = @import("image.zig");
-const Image = imagepkg.Image;
-const ImageMap = imagepkg.ImageMap;
-const ImagePlacementList = std.ArrayListUnmanaged(imagepkg.Placement);
+const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Terminal = terminal.Terminal;
 const Health = renderer.Health;
+const compat_file = @import("../lib/compat/file.zig");
 
 const getConstraint = @import("../font/nerd_font_attributes.zig").getConstraint;
 
@@ -77,11 +80,21 @@ const log = std.log.scoped(.generic_renderer);
 ///
 /// [ Texture ] - An abstraction over a GPU texture.
 ///
+/// [ ExportedFrame ] - A finished frame ready to be consumed by the apprt
+///                     in case that the frame needs to be composited with
+///                     UI elements by the graphical toolkit manually.
+///
 pub fn Renderer(comptime GraphicsAPI: type) type {
     return struct {
         const Self = @This();
 
         pub const API = GraphicsAPI;
+
+        pub const ExportedFrame = if (@hasDecl(GraphicsAPI, "ExportedFrame")) GraphicsAPI.ExportedFrame else void;
+
+        /// Whether +Y is down in the coordinate space of exported
+        /// frames. Apprts use this to orient frames when presenting.
+        pub const custom_shader_y_is_down = GraphicsAPI.custom_shader_y_is_down;
 
         const Target = GraphicsAPI.Target;
         const Buffer = GraphicsAPI.Buffer;
@@ -97,13 +110,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// This mutex must be held whenever any state used in `drawFrame` is
         /// being modified, and also when it's being accessed in `drawFrame`.
-        draw_mutex: std.Thread.Mutex = .{},
+        draw_mutex: std.Io.Mutex = .init,
 
         /// The configuration we need derived from the main config.
         config: DerivedConfig,
 
         /// The mailbox for communicating with the window.
         surface_mailbox: apprt.surface.Mailbox,
+
+        /// The latest exported frame ready to be consumed by an apprt
+        /// who needs to manually composite the frame with UI elements.
+        /// Previously exported frames are released when a new frame is
+        /// exported and pushed onto the queue.
+        ///
+        /// Unused if the renderer does not need to export frames to
+        /// present its rendered frame.
+        latest_frame: LatestFrame = .{},
 
         /// Current font metrics defining our grid.
         grid_metrics: font.Metrics,
@@ -114,46 +136,40 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// True if the window is focused
         focused: bool,
 
+        /// True if the window is visible.
+        visible: bool,
+
+        /// Flag to indicate that our focus state changed for custom
+        /// shaders to update their state.
+        custom_shader_focused_changed: bool = false,
+
         /// The most recent scrollbar state. We use this as a cache to
         /// determine if we need to notify the apprt that there was a
         /// scrollbar change.
         scrollbar: terminal.Scrollbar,
         scrollbar_dirty: bool,
 
-        /// The foreground color set by an OSC 10 sequence. If unset then
-        /// default_foreground_color is used.
-        foreground_color: ?terminal.color.RGB,
+        /// Tracks the last bottom-right pin of the screen to detect new output.
+        /// When the final line changes (node or y differs), new content was added.
+        /// Used for scroll-to-bottom on output feature.
+        last_bottom_node: ?usize,
+        last_bottom_y: terminal.size.CellCountInt,
 
-        /// Foreground color set in the user's config file.
-        default_foreground_color: terminal.color.RGB,
-
-        /// The background color set by an OSC 11 sequence. If unset then
-        /// default_background_color is used.
-        background_color: ?terminal.color.RGB,
-
-        /// Background color set in the user's config file.
-        default_background_color: terminal.color.RGB,
-
-        /// The cursor color set by an OSC 12 sequence. If unset then
-        /// default_cursor_color is used.
-        cursor_color: ?terminal.color.RGB,
-
-        /// Default cursor color when no color is set explicitly by an OSC 12 command.
-        /// This is cursor color as set in the user's config, if any. If no cursor color
-        /// is set in the user's config, then the cursor color is determined by the
-        /// current foreground color.
-        default_cursor_color: ?configpkg.Config.TerminalColor,
+        /// The most recent viewport matches so that we can render search
+        /// matches in the visible frame. This is provided asynchronously
+        /// from the search thread so we have the dirty flag to also note
+        /// if we need to rebuild our cells to include search highlights.
+        ///
+        /// Note that the selections MAY BE INVALID (point to PageList nodes
+        /// that do not exist anymore). These must be validated prior to use.
+        search_matches: ?renderer.Message.SearchMatches,
+        search_selected_match: ?renderer.Message.SearchMatch,
+        search_matches_dirty: bool,
 
         /// The current set of cells to render. This is rebuilt on every frame
         /// but we keep this around so that we don't reallocate. Each set of
         /// cells goes into a separate shader.
         cells: cellpkg.Contents,
-
-        /// The last viewport that we based our rebuild off of. If this changes,
-        /// then we do a full rebuild of the cells. The pointer values in this pin
-        /// are NOT SAFE to read because they may be modified, freed, etc from the
-        /// termio thread. We treat the pointers as integers for comparison only.
-        cells_viewport: ?terminal.Pin = null,
 
         /// Set to true after rebuildCells is called. This can be used
         /// to determine if any possible changes have been made to the
@@ -169,12 +185,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Timestamp we rendered out first frame.
         ///
         /// This is used when updating custom shader uniforms.
-        first_frame_time: ?std.time.Instant = null,
+        first_frame_time: ?std.Io.Timestamp = null,
 
         /// Timestamp when we rendered out more recent frame.
         ///
         /// This is used when updating custom shader uniforms.
-        last_frame_time: ?std.time.Instant = null,
+        last_frame_time: ?std.Io.Timestamp = null,
 
         /// The font structures.
         font_grid: *font.SharedGrid,
@@ -182,11 +198,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         font_shaper_cache: font.ShaperCache,
 
         /// The images that we may render.
-        images: ImageMap = .{},
-        image_placements: ImagePlacementList = .{},
-        image_bg_end: u32 = 0,
-        image_text_end: u32 = 0,
-        image_virtual: bool = false,
+        images: ImageState = .empty,
 
         /// Background image, if we have one.
         bg_image: ?imagepkg.Image = null,
@@ -214,8 +226,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
 
-        /// Our swap chain (multiple buffering)
-        swap_chain: SwapChain,
+        /// Health of how well the apprt can present our frames.
+        ///
+        /// This is separate from `health` because a renderer
+        /// can produce healthy frames that the apprt can't present.
+        presentation_health: std.atomic.Value(Health) = .{ .raw = .healthy },
+
+        /// True when we have a graphics context that can create GPU
+        /// resources. Creating any GPU resource while this is false is invalid.
+        display_realized: bool = true,
+
+        /// Our swap chain (multiple buffering). Null when it has
+        /// been released, either because the surface is hidden
+        /// (`releaseGpuResources`) or because the display is
+        /// unrealized. Rebuilt on the next `drawFrame`.
+        swap_chain: ?SwapChain,
 
         /// This value is used to force-update swap chain targets in the
         /// event of a config change that requires it (such as blending mode).
@@ -231,6 +256,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Our shader pipelines.
         shaders: Shaders,
 
+        /// The render state we update per loop.
+        terminal_state: terminal.RenderState = .empty,
+
+        /// The number of frames since the last terminal state reset.
+        /// We reset the terminal state after ~100,000 frames (about 10 to
+        /// 15 minutes at 120Hz) to prevent wasted memory buildup from
+        /// a large screen.
+        terminal_state_frame_count: usize = 0,
+
+        /// Our overlay state, if any.
+        overlay: ?Overlay = null,
+
+        /// The base timestamp for the Kitty graphics animation clock.
+        /// Animation frame timing is expressed as milliseconds since
+        /// this instant. Set on the first frame update that observes
+        /// Kitty images.
+        kitty_animation_clock: ?std.Io.Timestamp = null,
+
+        /// When the next Kitty animation frame is due, in
+        /// milliseconds on the animation clock, from the most recent
+        /// frame update. Null when no running animation needs a
+        /// wakeup.
+        kitty_animation_next_ms: ?u64 = null,
+
+        const HighlightTag = enum(u8) {
+            search_match,
+            search_match_selected,
+        };
         /// Swap chain which maintains multiple copies of the state needed to
         /// render a frame, so that we can start building the next frame while
         /// the previous frame is still being processed on the GPU.
@@ -248,15 +301,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             frame_index: std.math.IntFittingRange(0, buf_count) = 0,
             /// Semaphore that we wait on to make sure we have an available
             /// frame state struct so we can start working on a new frame.
-            frame_sema: std.Thread.Semaphore = .{ .permits = buf_count },
-
-            /// Set to true when deinited, if you try to deinit a defunct
-            /// swap chain it will just be ignored, to prevent double-free.
-            ///
-            /// This is required because of `displayUnrealized`, since it
-            /// `deinits` the swapchain, which leads to a double-free if
-            /// the renderer is deinited after that.
-            defunct: bool = false,
+            frame_sema: std.Io.Semaphore = .{ .permits = buf_count },
 
             pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
                 var result: SwapChain = .{ .frames = undefined };
@@ -270,30 +315,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *SwapChain) void {
-                if (self.defunct) return;
-                self.defunct = true;
-
                 // Wait for all of our inflight draws to complete
                 // so that we can cleanly deinit our GPU state.
-                for (0..buf_count) |_| self.frame_sema.wait();
+                for (0..buf_count) |_| self.frame_sema.waitUncancelable(
+                    global.io(),
+                );
                 for (&self.frames) |*frame| frame.deinit();
             }
 
             /// Get the next frame state to draw to. This will wait on the
             /// semaphore to ensure that the frame is available. This must
             /// always be paired with a call to releaseFrame.
-            pub fn nextFrame(self: *SwapChain) error{Defunct}!*FrameState {
-                if (self.defunct) return error.Defunct;
-
-                self.frame_sema.wait();
-                errdefer self.frame_sema.post();
+            pub fn nextFrame(self: *SwapChain) *FrameState {
+                self.frame_sema.waitUncancelable(global.io());
                 self.frame_index = (self.frame_index + 1) % buf_count;
                 return &self.frames[self.frame_index];
             }
 
             /// This should be called when the frame has completed drawing.
             pub fn releaseFrame(self: *SwapChain) void {
-                self.frame_sema.post();
+                self.frame_sema.post(global.io());
             }
         };
 
@@ -546,7 +587,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             foreground: terminal.color.RGB,
             selection_background: ?configpkg.Config.TerminalColor,
             selection_foreground: ?configpkg.Config.TerminalColor,
-            bold_color: ?configpkg.BoldColor,
+            search_background: configpkg.Config.TerminalColor,
+            search_foreground: configpkg.Config.TerminalColor,
+            search_selected_background: configpkg.Config.TerminalColor,
+            search_selected_foreground: configpkg.Config.TerminalColor,
+            bold_color: ?terminal.Style.BoldColor,
             faint_opacity: u8,
             min_contrast: f32,
             padding_color: configpkg.WindowPaddingColor,
@@ -560,6 +605,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             vsync: bool,
             colorspace: configpkg.Config.WindowColorspace,
             blending: configpkg.Config.AlphaBlending,
+            background_blur: configpkg.Config.BackgroundBlur,
+            scroll_to_bottom_on_output: bool,
+            custom_shader_animation: configpkg.CustomShaderAnimation,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -609,7 +657,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     .background = config.background.toTerminalRGB(),
                     .foreground = config.foreground.toTerminalRGB(),
-                    .bold_color = config.@"bold-color",
+                    .bold_color = if (config.@"bold-color") |b| b.toTerminal() else null,
                     .faint_opacity = @intFromFloat(@ceil(config.@"faint-opacity" * 255)),
 
                     .min_contrast = @floatCast(config.@"minimum-contrast"),
@@ -617,6 +665,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     .selection_background = config.@"selection-background",
                     .selection_foreground = config.@"selection-foreground",
+                    .search_background = config.@"search-background",
+                    .search_foreground = config.@"search-foreground",
+                    .search_selected_background = config.@"search-selected-background",
+                    .search_selected_foreground = config.@"search-selected-foreground",
 
                     .custom_shaders = custom_shaders,
                     .bg_image = bg_image,
@@ -628,6 +680,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .vsync = config.@"window-vsync",
                     .colorspace = config.@"window-colorspace",
                     .blending = config.@"alpha-blending",
+                    .background_blur = config.@"background-blur",
+                    .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
+                    .custom_shader_animation = config.@"custom-shader-animation",
                     .arena = arena,
                 };
             }
@@ -641,19 +696,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         pub fn init(alloc: Allocator, options: renderer.Options) !Self {
             // Initialize our graphics API wrapper, this will prepare the
-            // surface provided by the apprt and set up any API-specific
-            // GPU resources.
-            var api = try GraphicsAPI.init(alloc, options);
+            // surface provided by the apprt and set up any API- and surface-
+            // specific GPU resources.
+            var api = try GraphicsAPI.init(
+                alloc,
+                options.device,
+                options,
+            );
             errdefer api.deinit();
 
             const has_custom_shaders = options.config.custom_shaders.value.items.len > 0;
-
-            // Prepare our swap chain
-            var swap_chain = try SwapChain.init(
-                api,
-                has_custom_shaders,
-            );
-            errdefer swap_chain.deinit();
 
             // Create the font shaper.
             var font_shaper = try font.Shaper.init(alloc, .{
@@ -666,21 +718,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 metrics: font.Metrics,
             } = font_critical: {
                 const grid: *font.SharedGrid = options.font_grid;
-                grid.lock.lockShared();
-                defer grid.lock.unlockShared();
+                grid.lock.lockSharedUncancelable(global.io());
+                defer grid.lock.unlockShared(global.io());
                 break :font_critical .{
                     .metrics = grid.metrics,
                 };
             };
-
-            const display_link: ?DisplayLink = switch (builtin.os.tag) {
-                .macos => if (options.config.vsync)
-                    try macos.video.DisplayLink.createWithActiveCGDisplays()
-                else
-                    null,
-                else => null,
-            };
-            errdefer if (display_link) |v| v.release();
 
             var result: Self = .{
                 .alloc = alloc,
@@ -689,14 +732,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .grid_metrics = font_critical.metrics,
                 .size = options.size,
                 .focused = true,
+                .visible = true,
                 .scrollbar = .zero,
                 .scrollbar_dirty = false,
-                .foreground_color = null,
-                .default_foreground_color = options.config.foreground,
-                .background_color = null,
-                .default_background_color = options.config.background,
-                .cursor_color = null,
-                .default_cursor_color = options.config.cursor_color,
+                .last_bottom_node = null,
+                .last_bottom_y = 0,
+                .search_matches = null,
+                .search_selected_match = null,
+                .search_matches_dirty = false,
 
                 // Render state
                 .cells = .{},
@@ -714,6 +757,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         options.config.background.r,
                         options.config.background.g,
                         options.config.background.b,
+                        // Note that if we're on macOS with glass effects
+                        // we'll disable background opacity but we handle
+                        // that in updateFrame.
                         @intFromFloat(@round(options.config.background_opacity * 255.0)),
                     },
                     .bools = .{
@@ -738,7 +784,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .previous_cursor = @splat(0),
                     .current_cursor_color = @splat(0),
                     .previous_cursor_color = @splat(0),
+                    .current_cursor_style = 0,
+                    .previous_cursor_style = 0,
+                    .cursor_visible = 0,
                     .cursor_change_time = 0,
+                    .time_focus = 0,
+                    .focus = 1, // assume focused initially
+                    .palette = @splat(@splat(0)),
+                    .background_color = @splat(0),
+                    .foreground_color = @splat(0),
+                    .cursor_color = @splat(0),
+                    .cursor_text = @splat(0),
+                    .selection_background_color = @splat(0),
+                    .selection_foreground_color = @splat(0),
                 },
                 .bg_image_buffer = undefined,
 
@@ -747,16 +805,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .font_shaper = font_shaper,
                 .font_shaper_cache = font.ShaperCache.init(),
 
-                // Shaders (initialized below)
-                .shaders = undefined,
-
                 // Graphics API stuff
                 .api = api,
-                .swap_chain = swap_chain,
-                .display_link = display_link,
+                .swap_chain = null,
+                .has_custom_shaders = has_custom_shaders,
+                .reinitialize_shaders = true,
+                // Shaders are initialized lazily on the render thread.
+                .shaders = .uninit,
             };
-
-            try result.initShaders();
 
             // Ensure our undefined values above are correctly initialized.
             result.updateFontGridUniforms();
@@ -768,7 +824,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.swap_chain.deinit();
+            // This only deinitializes and frees CPU-side state
+            // and does not free GPU resources like the swap chain and
+            // shaders. Those are freed with `releaseGpuResources`.
+
+            if (self.overlay) |*overlay| overlay.deinit(self.alloc);
+            self.terminal_state.deinit(self.alloc);
+            if (self.search_selected_match) |*m| m.arena.deinit();
+            if (self.search_matches) |*m| m.arena.deinit();
+
+            self.latest_frame.deinit(global.io());
 
             if (DisplayLink != void) {
                 if (self.display_link) |display_link| {
@@ -783,25 +848,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.font_shaper_cache.deinit(self.alloc);
 
             self.config.deinit();
-
-            {
-                var it = self.images.iterator();
-                while (it.next()) |kv| kv.value_ptr.image.deinit(self.alloc);
-                self.images.deinit(self.alloc);
-            }
-            self.image_placements.deinit(self.alloc);
-
-            if (self.bg_image) |img| img.deinit(self.alloc);
-
-            self.deinitShaders();
-
             self.api.deinit();
 
             self.* = undefined;
-        }
-
-        fn deinitShaders(self: *Self) void {
-            self.shaders.deinit(self.alloc);
         }
 
         fn initShaders(self: *Self) !void {
@@ -831,33 +880,42 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.has_custom_shaders = has_custom_shaders;
         }
 
-        /// This is called early right after surface creation.
-        pub fn surfaceInit(surface: *apprt.Surface) !void {
-            // If our API has to do things here, let it.
-            if (@hasDecl(GraphicsAPI, "surfaceInit")) {
-                try GraphicsAPI.surfaceInit(surface);
-            }
-        }
-
-        /// This is called just prior to spinning up the renderer thread for
-        /// final main thread setup requirements.
-        pub fn finalizeSurfaceInit(self: *Self, surface: *apprt.Surface) !void {
-            // If our API has to do things to finalize surface init, let it.
-            if (@hasDecl(GraphicsAPI, "finalizeSurfaceInit")) {
-                try self.api.finalizeSurfaceInit(surface);
-            }
-        }
-
         /// Callback called by renderer.Thread when it begins.
-        pub fn threadEnter(self: *const Self, surface: *apprt.Surface) !void {
+        pub fn threadEnter(self: *Self, surface: *apprt.Surface) !void {
             // If our API has to do things on thread enter, let it.
             if (@hasDecl(GraphicsAPI, "threadEnter")) {
                 try self.api.threadEnter(surface);
             }
         }
 
-        /// Callback called by renderer.Thread when it exits.
-        pub fn threadExit(self: *const Self) void {
+        /// Callback called by renderer.Thread when it exits. Called on the
+        /// render thread. Releases all GPU resources before the API tears down
+        /// its context, since after this the GL context will be gone.
+        pub fn threadExit(self: *Self) void {
+            {
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
+
+                // Release swap chain and shaders. Shaders are only freed
+                // while unrealized and not every apprt unrealizes before
+                // destroying a surface (macOS never does), so mark it
+                // unrealized. This also stops any later draw.
+                self.display_realized = false;
+                self.releaseGpuResources();
+
+                // We don't release images in `releaseGpuResources`
+                // since it can be called whenever the terminal is
+                // occluded or unrealized, and we don't want to
+                // reupload images every time that happens.
+                self.images.deinit(self.alloc);
+                self.images = .empty;
+
+                if (self.bg_image) |img| {
+                    img.deinit(self.alloc);
+                    self.bg_image = null;
+                }
+            }
+
             // If our API has to do things on thread exit, let it.
             if (@hasDecl(GraphicsAPI, "threadExit")) {
                 self.api.threadExit();
@@ -874,16 +932,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // If we don't support a display link we have no work to do.
             if (comptime DisplayLink == void) return;
 
-            // This is when we know our "self" pointer is stable so we can
-            // setup the display link. To setup the display link we set our
-            // callback and we can start it immediately.
-            const display_link = self.display_link orelse return;
-            try display_link.setOutputCallback(
-                xev.Async,
-                &displayLinkCallback,
-                &thr.draw_now,
-            );
-            display_link.start() catch {};
+            self.syncDisplayLink(null, &thr.draw_now);
         }
 
         /// Called by renderer.Thread when it exits the main loop.
@@ -904,54 +953,101 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         /// This is called by the GTK apprt after the surface is
-        /// reinitialized due to any of the events mentioned in
-        /// the doc comment for `displayUnrealized`.
+        /// reinitialized (e.g. after the widget is re-realized following
+        /// a display change or reparenting).
         pub fn displayRealized(self: *Self) !void {
             // If our API has to do things on realize, let it.
             if (@hasDecl(GraphicsAPI, "displayRealized")) {
                 self.api.displayRealized();
             }
 
-            // Lock the draw mutex so that we can
-            // safely reinitialize our GPU resources.
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
+            // Lock the draw mutex so that we can safely update state.
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
 
-            // We assume that the swap chain was deinited in
-            // `displayUnrealized`, in which case it should be
-            // marked defunct. If not, we have a problem.
-            assert(self.swap_chain.defunct);
-
-            // We reinitialize our shaders and our swap chain.
-            try self.initShaders();
-            self.swap_chain = try SwapChain.init(
-                self.api,
-                self.has_custom_shaders,
-            );
-            self.reinitialize_shaders = false;
+            // Mark the display as realized. The render thread will lazily
+            // rebuild the swap chain and shaders on the next `drawFrame`,
+            // which is the right place for GL resource creation (it
+            // guarantees a current context on the render thread).
+            self.display_realized = true;
+            self.reinitialize_shaders = true;
             self.target_config_modified = 1;
         }
 
-        /// This is called by the GTK apprt when the surface is being destroyed.
-        /// This can happen because the surface is being closed but also when
-        /// moving the window between displays or splitting.
+        /// This is called when the surface is being unrealized.
+        /// This can happen because the surface is being closed but
+        /// also when moving the window between displays or splitting.
+        ///
+        /// This runs on the main thread and only updates CPU-side state
+        /// here; resource cleanup happens on the render thread via
+        /// `releaseGpuResources`.
         pub fn displayUnrealized(self: *Self) void {
-            // If our API has to do things on unrealize, let it.
-            if (@hasDecl(GraphicsAPI, "displayUnrealized")) {
-                self.api.displayUnrealized();
+            // Lock the draw mutex so that we can safely update state.
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+
+            // Clearing `display_realized` ensures drawFrame doesn't attempt
+            // to rebuild the swap chain or make any graphics API calls.
+            // The actual GPU resource release is done by the render thread.
+            self.display_realized = false;
+        }
+
+        /// A thread-safe, single-slot "latest wins" queue. The render thread
+        /// calls `push` with the latest frame; the apprt calls `take` in its
+        /// snapshot handler to grab the most recent frame. Old frames are
+        /// dropped and released. For a terminal this is correct — we never
+        /// want to queue up frames behind a slow compositor.
+        const LatestFrame = struct {
+            const Self = @This();
+            mutex: std.Io.Mutex = .init,
+            latest: ?ExportedFrame = null,
+
+            pub fn push(self: *LatestFrame, io: std.Io, value: ExportedFrame) void {
+                if (comptime ExportedFrame == void) return;
+
+                self.mutex.lockUncancelable(io);
+                defer self.mutex.unlock(io);
+                if (self.latest) |*old| old.deinit();
+                self.latest = value;
             }
 
-            // Lock the draw mutex so that we can
-            // safely deinitialize our GPU resources.
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
+            pub fn take(self: *LatestFrame, io: std.Io) ?ExportedFrame {
+                if (comptime ExportedFrame == void) return null;
 
-            // We deinit our swap chain and shaders.
-            //
-            // This will mark them as defunct so that they
-            // can't be double-freed or used in draw calls.
-            self.swap_chain.deinit();
-            self.shaders.deinit(self.alloc);
+                self.mutex.lockUncancelable(io);
+                defer self.mutex.unlock(io);
+                const result = self.latest orelse return null;
+                self.latest = null;
+                return result;
+            }
+
+            pub fn deinit(self: *LatestFrame, io: std.Io) void {
+                if (comptime ExportedFrame == void) return;
+
+                self.mutex.lockUncancelable(io);
+                defer self.mutex.unlock(io);
+                if (self.latest) |*v| v.deinit();
+                self.latest = null;
+            }
+        };
+
+        /// Push the latest completed frame, replacing if one previously
+        /// existed. Called on the render thread.
+        ///
+        /// Has no effect for renderers that do not export frames
+        /// (i.e. `ExportedFrame == void`).
+        pub fn pushFrame(self: *Self, frame: ExportedFrame) void {
+            return self.latest_frame.push(global.io(), frame);
+        }
+
+        /// Take the latest completed frame for the apprt to composite.
+        /// Returns null if no frame is available. The caller takes
+        /// ownership of the returned frame. Called on the main thread.
+        ///
+        /// Has no effect for renderers that do not export frames
+        /// (i.e. `ExportedFrame == void`).
+        pub fn takeFrame(self: *Self) ?ExportedFrame {
+            return self.latest_frame.take(global.io());
         }
 
         fn displayLinkCallback(
@@ -965,24 +1061,88 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         /// Mark the full screen as dirty so that we redraw everything.
-        pub fn markDirty(self: *Self) void {
-            self.cells_viewport = null;
+        pub inline fn markDirty(self: *Self) void {
+            self.terminal_state.dirty = .full;
         }
 
         /// Called when we get an updated display ID for our display link.
-        pub fn setMacOSDisplayID(self: *Self, id: u32) !void {
+        pub fn setMacOSDisplayID(
+            self: *Self,
+            id: u32,
+            draw_now: *xev.Async,
+        ) !void {
             if (comptime DisplayLink == void) return;
-            const display_link = self.display_link orelse return;
-            log.info("updating display link display id={}", .{id});
-            display_link.setCurrentCGDisplay(id) catch |err| {
-                log.warn("error setting display link display id err={}", .{err});
-            };
+            self.syncDisplayLink(id, draw_now);
         }
 
-        /// True if our renderer has animations so that a higher frequency
-        /// timer is used.
-        pub fn hasAnimations(self: *const Self) bool {
-            return self.has_custom_shaders;
+        /// The cadence of continuous (draw-only) animation wakes,
+        /// i.e. 120fps, and the floor for any animation wake delay.
+        pub const draw_interval_ms: u64 = 8;
+
+        /// A point in the future when the renderer needs to be driven
+        /// again to keep animating, and what kind of drive it needs.
+        pub const AnimationWake = struct {
+            /// Delay in milliseconds until the wake is due.
+            delay_ms: u64,
+            kind: Kind,
+
+            pub const Kind = enum {
+                /// A redraw alone suffices, no updateFrame. Much cheaper
+                /// than `update`.
+                draw,
+
+                /// Frame data must be updated first: updateFrame, then draw.
+                update,
+            };
+        };
+
+        /// The soonest animation wake this renderer needs, if any:
+        /// custom shader animation wants continuous draw-only wakes
+        /// at draw_interval_ms while active, and a running Kitty
+        /// graphics animation wants an update wake when its next
+        /// frame is due. The renderer thread drives its animation
+        /// timer off this, re-querying after every wake.
+        ///
+        /// Must be called on the render thread.
+        pub fn animationWake(self: *const Self) ?AnimationWake {
+            // Custom shaders animate by redrawing on a fixed cadence,
+            // gated by configuration and focus.
+            const shader_delay: ?u64 = shader: {
+                if (!self.has_custom_shaders) break :shader null;
+                break :shader switch (self.config.custom_shader_animation) {
+                    .false => null,
+                    .always => draw_interval_ms,
+                    .true => if (self.focused) draw_interval_ms else null,
+                };
+            };
+
+            // Kitty animations tick during updateFrame; between
+            // updates the deadline is absolute on the animation
+            // clock, so a stream of draw wakes recomputing this
+            // cannot starve it into the future.
+            const kitty_delay: ?u64 = kitty: {
+                const next = self.kitty_animation_next_ms orelse break :kitty null;
+                const base = self.kitty_animation_clock orelse break :kitty null;
+                const now: std.Io.Timestamp = .now(global.io(), .awake);
+                const now_ms: u64 = @intCast(@divTrunc(
+                    base.durationTo(now).nanoseconds,
+                    std.time.ns_per_ms,
+                ));
+                // Never wake faster than the draw interval; an
+                // overdue frame is picked up on the next wake.
+                break :kitty @max(next -| now_ms, draw_interval_ms);
+            };
+
+            // An update wake includes a draw, so it wins ties.
+            if (kitty_delay) |k| {
+                if (shader_delay == null or k <= shader_delay.?) {
+                    return .{ .delay_ms = k, .kind = .update };
+                }
+            }
+
+            if (shader_delay) |s| return .{ .delay_ms = s, .kind = .draw };
+
+            return null;
         }
 
         /// True if our renderer is using vsync. If true, the renderer or apprt
@@ -998,35 +1158,127 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Must be called on the render thread.
         pub fn setFocus(self: *Self, focus: bool) !void {
+            assert(self.focused != focus);
+
             self.focused = focus;
 
-            // If we're not focused, then we want to stop the display link
-            // because it is a waste of resources and we can move to pure
-            // change-driven updates.
-            if (comptime DisplayLink != void) link: {
-                const display_link = self.display_link orelse break :link;
-                if (focus) {
-                    display_link.start() catch {};
-                } else {
-                    display_link.stop() catch {};
-                }
-            }
+            // Flag that we need to update our custom shaders
+            self.custom_shader_focused_changed = true;
+
+            self.syncDisplayLink(null, null);
+        }
+
+        /// Called when the apprt reports a change in how well
+        /// frames can be presented.
+        pub fn setPresentationHealth(self: *Self, health: Health) void {
+            self.presentation_health.store(health, .seq_cst);
+        }
+
+        /// Returns how well frames can be presented.
+        pub fn presentationHealth(self: *Self) Health {
+            return self.presentation_health.load(.seq_cst);
         }
 
         /// Callback when the window is visible or occluded.
         ///
         /// Must be called on the render thread.
         pub fn setVisible(self: *Self, visible: bool) void {
-            // If we're not visible, then we want to stop the display link
-            // because it is a waste of resources and we can move to pure
-            // change-driven updates.
-            if (comptime DisplayLink != void) link: {
-                const display_link = self.display_link orelse break :link;
-                if (visible and self.focused) {
+            self.visible = visible;
+            self.syncDisplayLink(null, null);
+
+            // When we're hidden, release our GPU resources.
+            if (!visible) {
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
+                self.releaseGpuResources();
+            }
+        }
+
+        /// Release the GPU resources we hold while the surface is not
+        /// visible. Today this is the swap chain (render targets, font
+        /// atlas texture copies, cell buffers, custom shader textures),
+        /// which makes up nearly all of a surface's GPU memory usage.
+        /// The swap chain is rebuilt on the next `drawFrame`.
+        ///
+        /// Note that images are NOT released here since we don't want
+        /// to reupload images every time the terminal is brought back
+        /// from being occluded or unrealized.
+        ///
+        /// Caller must lock the draw mutex before calling this function.
+        /// Resources that are already released are skipped.
+        pub fn releaseGpuResources(self: *Self) void {
+            if (self.swap_chain) |*sc| {
+                // Waits for any in-flight frames to complete, then
+                // frees all GPU resources.
+                sc.deinit();
+                self.swap_chain = null;
+            }
+
+            // Release the shaders as well if we're unrealized.
+            if (!self.display_realized) {
+                self.shaders.deinit(self.alloc);
+            }
+        }
+
+        /// Create or update the display link and match it to the current
+        /// surface state.
+        ///
+        /// Must be called on the render thread and must NOT be called
+        /// while holding `draw_mutex`. Stopping a CVDisplayLink is a
+        /// blocking join on CoreVideo's IO thread, and the apprt calls
+        /// `drawFrame` (which takes `draw_mutex`) from the CoreAnimation
+        /// layer display path on the main thread.
+        fn syncDisplayLink(
+            self: *Self,
+            display_id: ?u32,
+            draw_now: ?*xev.Async,
+        ) void {
+            if (comptime DisplayLink == void) return;
+
+            const display_link = self.display_link orelse display_link: {
+                if (!self.config.vsync) return;
+                const callback = draw_now orelse return;
+                const result = macos.video.DisplayLink.createWithActiveCGDisplays() catch |err| {
+                    // A locked macOS session can temporarily have no active
+                    // displays. Rendering can continue without vsync and a
+                    // later display update will retry this method.
+                    log.warn("error creating display link; using fallback rendering err={}", .{err});
+                    return;
+                };
+                result.setOutputCallback(
+                    xev.Async,
+                    &displayLinkCallback,
+                    callback,
+                ) catch |err| {
+                    log.warn("error configuring display link err={}", .{err});
+                    result.release();
+                    return;
+                };
+
+                self.display_link = result;
+                log.info("created display link", .{});
+                break :display_link result;
+            };
+
+            if (display_id) |id| {
+                log.info("updating display link display id={}", .{id});
+                display_link.setCurrentCGDisplay(id) catch |err| {
+                    log.warn("error setting display link display id err={}", .{err});
+                };
+            }
+
+            const should_run =
+                // Non-visible windows never vsync
+                self.visible and
+                // Only vsync if we have cell changes or animation
+                (self.cells_rebuilt or self.animationWake() != null);
+
+            if (should_run) {
+                if (!display_link.isRunning()) {
                     display_link.start() catch {};
-                } else {
-                    display_link.stop() catch {};
                 }
+            } else {
+                display_link.stop() catch {};
             }
         }
 
@@ -1034,19 +1286,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Must be called on the render thread.
         pub fn setFontGrid(self: *Self, grid: *font.SharedGrid) void {
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
 
             // Update our grid
             self.font_grid = grid;
 
             // Update all our textures so that they sync on the next frame.
             // We can modify this without a lock because the GPU does not
-            // touch this data.
-            for (&self.swap_chain.frames) |*frame| {
+            // touch this data. A released swap chain is rebuilt with
+            // fresh frames that sync all textures on first use.
+            if (self.swap_chain) |*sc| for (&sc.frames) |*frame| {
                 frame.grayscale_modified = 0;
                 frame.color_modified = 0;
-            }
+            };
 
             // Get our metrics from the grid. This doesn't require a lock because
             // the metrics are never recalculated.
@@ -1072,7 +1325,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Force a full rebuild, because cached rows may still reference
             // an outdated atlas from the old grid and this can cause garbage
             // to be rendered.
-            self.cells_viewport = null;
+            self.markDirty();
         }
 
         /// Update uniforms that are based on the font grid.
@@ -1090,34 +1343,53 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             state: *renderer.State,
             cursor_blink_visible: bool,
-        ) !void {
+        ) Allocator.Error!void {
+            // CoreText shaping accumulates objects for deferred release over
+            // the course of a frame. Always flush those objects, including
+            // when rebuilding the frame fails due to memory pressure.
+            defer self.font_shaper.endFrame();
+
+            // We fully deinit and reset the terminal state every so often
+            // so that a particularly large terminal state doesn't cause
+            // the renderer to hold on to retained memory.
+            //
+            // Frame count is ~12 minutes at 120Hz.
+            const max_terminal_state_frame_count = 100_000;
+            if (self.terminal_state_frame_count >= max_terminal_state_frame_count) {
+                self.terminal_state.deinit(self.alloc);
+                self.terminal_state = .empty;
+                self.terminal_state_frame_count = 0;
+            }
+            self.terminal_state_frame_count += 1;
+
+            // Create an arena for all our temporary allocations while rebuilding
+            var arena = ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const arena_alloc = arena.allocator();
+
             // Data we extract out of the critical area.
             const Critical = struct {
-                bg: terminal.color.RGB,
-                screen: terminal.Screen,
-                screen_type: terminal.ScreenType,
+                links: terminal.RenderState.CellSet,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
-                cursor_style: ?renderer.CursorStyle,
-                color_palette: terminal.color.Palette,
                 scrollbar: terminal.Scrollbar,
-
-                /// If true, rebuild the full screen.
-                full_rebuild: bool,
+                overlay_features: []const Overlay.Feature,
             };
 
             // Update all our data as tightly as possible within the mutex.
             var critical: Critical = critical: {
+                // NOTE: This code needs be updated to 0.16.0 before you
+                // un-comment it ;)
+                //
                 // const start = try std.time.Instant.now();
                 // const start_micro = std.time.microTimestamp();
                 // defer {
                 //     const end = std.time.Instant.now() catch unreachable;
-                //     // "[updateFrame critical time] <START us>\t<TIME_TAKEN us>"
-                //     std.log.err("[updateFrame critical time] {}\t{}", .{start_micro, end.since(start) / std.time.ns_per_us});
+                //     std.log.err("[updateFrame critical time] start={}\tduration={} us", .{ start_micro, end.since(start) / std.time.ns_per_us });
                 // }
 
-                state.mutex.lock();
-                defer state.mutex.unlock();
+                state.lockDemand(global.io());
+                defer state.unlockDemand(global.io());
 
                 // If we're in a synchronized output state, we pause all rendering.
                 if (state.terminal.modes.get(.synchronized_output)) {
@@ -1125,74 +1397,81 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     return;
                 }
 
+                // If scroll-to-bottom on output is enabled, check if the final line
+                // changed by comparing the bottom-right pin. If the node pointer or
+                // y offset changed, new content was added to the screen.
+                // Update this BEFORE we update our render state so we can
+                // draw the new scrolled data immediately.
+                if (self.config.scroll_to_bottom_on_output) scroll: {
+                    const br = state.terminal.screens.active.pages.getBottomRight(.screen) orelse break :scroll;
+
+                    // If the pin hasn't changed, then don't scroll.
+                    if (self.last_bottom_node == @intFromPtr(br.node) and
+                        self.last_bottom_y == br.y) break :scroll;
+
+                    // Update tracked pin state for next frame
+                    self.last_bottom_node = @intFromPtr(br.node);
+                    self.last_bottom_y = br.y;
+
+                    // Scroll
+                    state.terminal.scrollViewport(.bottom);
+                }
+
+                // Begin the update of our terminal state. Work that
+                // doesn't require terminal access (e.g. style
+                // denormalization) is deferred to the endUpdate call
+                // outside of this critical section, keeping our lock
+                // hold time as short as possible.
+                try self.terminal_state.beginUpdate(
+                    self.alloc,
+                    state.terminal,
+                );
+
+                // If our terminal state is dirty at all we need to redo
+                // the viewport search.
+                if (self.terminal_state.dirty != .false) {
+                    state.terminal.flags.search_viewport_dirty = true;
+                }
+
                 // Get our scrollbar out of the terminal. We synchronize
                 // the scrollbar read with frame data updates because this
                 // naturally limits the number of calls to this method (it
                 // can be expensive) and also makes it so we don't need another
                 // cross-thread mailbox message within the IO path.
-                const scrollbar = state.terminal.screen.pages.scrollbar();
-
-                // Swap bg/fg if the terminal is reversed
-                const bg = self.background_color orelse self.default_background_color;
-                const fg = self.foreground_color orelse self.default_foreground_color;
-                defer {
-                    if (self.background_color) |*c| {
-                        c.* = bg;
-                    } else {
-                        self.default_background_color = bg;
-                    }
-
-                    if (self.foreground_color) |*c| {
-                        c.* = fg;
-                    } else {
-                        self.default_foreground_color = fg;
-                    }
-                }
-
-                if (state.terminal.modes.get(.reverse_colors)) {
-                    if (self.background_color) |*c| {
-                        c.* = fg;
-                    } else {
-                        self.default_background_color = fg;
-                    }
-
-                    if (self.foreground_color) |*c| {
-                        c.* = bg;
-                    } else {
-                        self.default_foreground_color = bg;
-                    }
-                }
-
-                // Get the viewport pin so that we can compare it to the current.
-                const viewport_pin = state.terminal.screen.pages.pin(.{ .viewport = .{} }).?;
-
-                // We used to share terminal state, but we've since learned through
-                // analysis that it is faster to copy the terminal state than to
-                // hold the lock while rebuilding GPU cells.
-                var screen_copy = try state.terminal.screen.clone(
-                    self.alloc,
-                    .{ .viewport = .{} },
-                    null,
-                );
-                errdefer screen_copy.deinit();
-
-                // Whether to draw our cursor or not.
-                const cursor_style = if (state.terminal.flags.password_input)
-                    .lock
-                else
-                    renderer.cursorStyle(
-                        state,
-                        self.focused,
-                        cursor_blink_visible,
-                    );
+                const scrollbar = state.terminal.screens.active.pages.scrollbar();
 
                 // Get our preedit state
                 const preedit: ?renderer.State.Preedit = preedit: {
-                    if (cursor_style == null) break :preedit null;
                     const p = state.preedit orelse break :preedit null;
-                    break :preedit try p.clone(self.alloc);
+                    break :preedit try p.clone(arena_alloc);
                 };
-                errdefer if (preedit) |p| p.deinit(self.alloc);
+
+                // Advance any running Kitty graphics animations to the
+                // frame due now, and remember when the next frame is
+                // due (as an absolute deadline, see animationWake) so
+                // the renderer thread can schedule a wakeup for it.
+                // This must happen before the dirty check below:
+                // advancing a frame marks the image state dirty.
+                self.kitty_animation_next_ms = next: {
+                    // Likely case: we have no kitty images, so do nothing.
+                    const storage = &state.terminal.screens.active.kitty_images;
+                    if (storage.images.count() == 0) break :next null;
+
+                    const now: std.Io.Timestamp = .now(global.io(), .awake);
+                    const base = self.kitty_animation_clock orelse base: {
+                        self.kitty_animation_clock = now;
+                        break :base now;
+                    };
+                    const now_ms: u64 = @intCast(@divTrunc(
+                        base.durationTo(now).nanoseconds,
+                        std.time.ns_per_ms,
+                    ));
+                    const delay = storage.animationTick(
+                        global.io(),
+                        now_ms,
+                    ) orelse break :next null;
+                    break :next now_ms + delay;
+                };
 
                 // If we have Kitty graphics data, we enter a SLOW SLOW SLOW path.
                 // We only do this if the Kitty image state is dirty meaning only if
@@ -1201,92 +1480,159 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we have any virtual references, we must also rebuild our
                 // kitty state on every frame because any cell change can move
                 // an image.
-                if (state.terminal.screen.kitty_images.dirty or
-                    self.image_virtual)
-                {
-                    try self.prepKittyGraphics(state.terminal);
+                if (self.images.kittyRequiresUpdate(state.terminal)) {
+                    // We need to grab the draw mutex since this updates
+                    // our image state that drawFrame uses.
+                    self.draw_mutex.lockUncancelable(global.io());
+                    defer self.draw_mutex.unlock(global.io());
+                    self.images.kittyUpdate(
+                        self.alloc,
+                        state.terminal,
+                        .{
+                            .width = self.grid_metrics.cell_width,
+                            .height = self.grid_metrics.cell_height,
+                        },
+                    );
                 }
 
-                // If we have any terminal dirty flags set then we need to rebuild
-                // the entire screen. This can be optimized in the future.
-                const full_rebuild: bool = rebuild: {
-                    {
-                        const Int = @typeInfo(terminal.Terminal.Dirty).@"struct".backing_integer.?;
-                        const v: Int = @bitCast(state.terminal.flags.dirty);
-                        if (v > 0) break :rebuild true;
-                    }
-                    {
-                        const Int = @typeInfo(terminal.Screen.Dirty).@"struct".backing_integer.?;
-                        const v: Int = @bitCast(state.terminal.screen.dirty);
-                        if (v > 0) break :rebuild true;
-                    }
+                // Get our OSC8 links we're hovering if we have a mouse.
+                // This requires terminal state because of URLs.
+                const links: terminal.RenderState.CellSet = osc8: {
+                    // If our mouse isn't hovering, we have no links.
+                    const vp = state.mouse.point orelse break :osc8 .empty;
 
-                    // If our viewport changed then we need to rebuild the entire
-                    // screen because it means we scrolled. If we have no previous
-                    // viewport then we must rebuild.
-                    const prev_viewport = self.cells_viewport orelse break :rebuild true;
-                    if (!prev_viewport.eql(viewport_pin)) break :rebuild true;
+                    // If the right mods aren't pressed, then we can't match.
+                    if (!state.mouse.mods.equal(inputpkg.ctrlOrSuper(.{})))
+                        break :osc8 .empty;
 
-                    break :rebuild false;
+                    break :osc8 self.terminal_state.linkCells(
+                        arena_alloc,
+                        vp,
+                    ) catch |err| {
+                        log.warn("error searching for OSC8 links err={}", .{err});
+                        break :osc8 .empty;
+                    };
                 };
 
-                // Reset the dirty flags in the terminal and screen. We assume
-                // that our rebuild will be successful since so we optimize for
-                // success and reset while we hold the lock. This is much easier
-                // than coordinating row by row or as changes are persisted.
-                state.terminal.flags.dirty = .{};
-                state.terminal.screen.dirty = .{};
-                {
-                    var it = state.terminal.screen.pages.pageIterator(
-                        .right_down,
-                        .{ .screen = .{} },
-                        null,
-                    );
-                    while (it.next()) |chunk| {
-                        var dirty_set = chunk.node.data.dirtyBitSet();
-                        dirty_set.unsetAll();
-                    }
-                }
-
-                // Update our viewport pin
-                self.cells_viewport = viewport_pin;
+                const overlay_features: []const Overlay.Feature = overlay: {
+                    const insp = state.inspector orelse break :overlay &.{};
+                    const renderer_info = insp.rendererInfo();
+                    break :overlay renderer_info.overlayFeatures(
+                        arena_alloc,
+                    ) catch &.{};
+                };
 
                 break :critical .{
-                    .bg = self.background_color orelse self.default_background_color,
-                    .screen = screen_copy,
-                    .screen_type = state.terminal.active_screen,
+                    .links = links,
                     .mouse = state.mouse,
                     .preedit = preedit,
-                    .cursor_style = cursor_style,
-                    .color_palette = state.terminal.color_palette.colors,
                     .scrollbar = scrollbar,
-                    .full_rebuild = full_rebuild,
+                    .overlay_features = overlay_features,
                 };
             };
-            defer {
-                critical.screen.deinit();
-                if (critical.preedit) |p| p.deinit(self.alloc);
+
+            // Outside the critical area, complete the update we began
+            // within it. This must be done before anything reads the
+            // render state (e.g. rebuildCells).
+            self.terminal_state.endUpdate();
+
+            // Outside the critical area we can update our links to contain
+            // our regex results.
+            self.config.links.renderCellMap(
+                arena_alloc,
+                &critical.links,
+                &self.terminal_state,
+                state.mouse.point,
+                state.mouse.mods,
+            ) catch |err| {
+                log.warn("error searching for regex links err={}", .{err});
+            };
+
+            // Clear our highlight state and update.
+            if (self.search_matches_dirty or self.terminal_state.dirty != .false) {
+                self.search_matches_dirty = false;
+
+                // Clear the prior highlights
+                const row_data = self.terminal_state.row_data.slice();
+                var any_dirty: bool = false;
+                for (
+                    row_data.items(.highlights),
+                    row_data.items(.dirty),
+                ) |*highlights, *dirty| {
+                    if (highlights.items.len > 0) {
+                        highlights.clearRetainingCapacity();
+                        dirty.* = true;
+                        any_dirty = true;
+                    }
+                }
+                if (any_dirty and self.terminal_state.dirty == .false) {
+                    self.terminal_state.dirty = .partial;
+                }
+
+                // NOTE: The order below matters. Highlights added earlier
+                // will take priority.
+
+                if (self.search_selected_match) |m| {
+                    self.terminal_state.updateHighlightsFlattened(
+                        self.alloc,
+                        @intFromEnum(HighlightTag.search_match_selected),
+                        &.{m.match},
+                    ) catch |err| {
+                        // Not a critical error, we just won't show highlights.
+                        log.warn("error updating search selected highlight err={}", .{err});
+                    };
+                }
+
+                if (self.search_matches) |m| {
+                    self.terminal_state.updateHighlightsFlattened(
+                        self.alloc,
+                        @intFromEnum(HighlightTag.search_match),
+                        m.matches,
+                    ) catch |err| {
+                        // Not a critical error, we just won't show highlights.
+                        log.warn("error updating search highlights err={}", .{err});
+                    };
+                }
             }
 
-            // Build our GPU cells
-            try self.rebuildCells(
-                critical.full_rebuild,
-                &critical.screen,
-                critical.screen_type,
-                critical.mouse,
-                critical.preedit,
-                critical.cursor_style,
-                &critical.color_palette,
-            );
+            // From this point forward no more errors.
+            errdefer comptime unreachable;
 
-            // Notify our shaper we're done for the frame. For some shapers,
-            // such as CoreText, this triggers off-thread cleanup logic.
-            self.font_shaper.endFrame();
+            // Reset our dirty state after updating.
+            defer self.terminal_state.dirty = .false;
 
-            // Acquire the draw mutex because we're modifying state here.
+            // Rebuild the overlay image if we have one. We can do this
+            // outside of any critical areas.
+            self.rebuildOverlay(
+                critical.overlay_features,
+            ) catch |err| {
+                log.warn(
+                    "error rebuilding overlay surface err={}",
+                    .{err},
+                );
+            };
+
+            // Acquire the draw mutex for all remaining state updates.
             {
-                self.draw_mutex.lock();
-                defer self.draw_mutex.unlock();
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
+
+                // Build our GPU cells
+                self.rebuildCells(
+                    critical.preedit,
+                    renderer.cursorStyle(&self.terminal_state, .{
+                        .preedit = critical.preedit != null,
+                        .focused = self.focused,
+                        .blink_visible = cursor_blink_visible,
+                    }),
+                    &critical.links,
+                ) catch |err| {
+                    // This means we weren't able to allocate our buffer
+                    // to update the cells. In this case, we continue with
+                    // our old buffer (frozen contents) and log it.
+                    comptime assert(@TypeOf(err) == error{OutOfMemory});
+                    log.warn("error rebuilding GPU cells err={}", .{err});
+                };
 
                 // The scrollbar is only emitted during draws so we also
                 // check the scrollbar cache here and update if needed.
@@ -1298,12 +1644,39 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Update our background color
                 self.uniforms.bg_color = .{
-                    critical.bg.r,
-                    critical.bg.g,
-                    critical.bg.b,
+                    self.terminal_state.colors.background.r,
+                    self.terminal_state.colors.background.g,
+                    self.terminal_state.colors.background.b,
                     @intFromFloat(@round(self.config.background_opacity * 255.0)),
                 };
+
+                // If we're on macOS and have glass styles, we remove
+                // the background opacity because the glass effect handles
+                // it.
+                if (comptime builtin.os.tag == .macos) switch (self.config.background_blur) {
+                    .@"macos-glass-regular",
+                    .@"macos-glass-clear",
+                    => self.uniforms.bg_color[3] = 0,
+
+                    else => {},
+                };
+
+                // Prepare our overlay image for upload (or unload). This
+                // has to use our general allocator since it modifies
+                // state that survives frames.
+                self.images.overlayUpdate(
+                    self.alloc,
+                    self.overlay,
+                ) catch |err| {
+                    log.warn("error updating overlay images err={}", .{err});
+                };
+
+                // Update custom shader uniforms that depend on terminal state.
+                self.updateCustomShaderUniformsFromState();
             }
+
+            // Start the display link now that the rebuilt frame is ready.
+            self.syncDisplayLink(null, null);
         }
 
         /// Draw the frame to the screen.
@@ -1314,11 +1687,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             sync: bool,
         ) !void {
-            // We hold a the draw mutex to prevent changes to any
-            // data we access while we're in the middle of drawing.
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
+            // Everything that touches draw state happens under the draw
+            // mutex. The display link is synced only after the mutex is
+            // released; see `syncDisplayLink` for why it must never be
+            // called with the draw mutex held.
+            const sync_display_link = locked: {
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
+                break :locked try self.drawFrameLocked(sync);
+            };
 
+            if (sync_display_link) self.syncDisplayLink(null, null);
+        }
+
+        /// The body of `drawFrame`. Must be called with `draw_mutex` held.
+        ///
+        /// Returns true if the display link should be resynced once the
+        /// draw mutex is released. This is only ever true on the no-redraw
+        /// path, which a sync draw never takes, so the main thread's sync
+        /// draws never touch the display link and `syncDisplayLink` stays
+        /// on the render thread.
+        fn drawFrameLocked(
+            self: *Self,
+            sync: bool,
+        ) !bool {
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
             defer if (self.scrollbar_dirty) {
@@ -1339,7 +1731,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // If either of our surface dimensions is zero
             // then drawing is absurd, so we just return.
-            if (surface_size.width == 0 or surface_size.height == 0) return;
+            if (surface_size.width == 0 or surface_size.height == 0) return false;
+
+            // If we have no graphics context we can't draw. This is
+            // only the case while unrealized (GTK) or after the render
+            // thread exits; displayRealized rebuilds the swap chain.
+            if (!self.display_realized) return false;
+
+            // Get our swap chain, rebuilding it if it was released
+            // while we were hidden. Rebuilding is deferred to draw
+            // time because resource creation must happen somewhere
+            // our graphics API allows it (OpenGL requires a current
+            // context, which drawFrame guarantees).
+            const swap_chain: *SwapChain, const swap_chain_rebuilt: bool =
+                if (self.swap_chain) |*sc| .{ sc, false } else rebuild: {
+                    self.swap_chain = try SwapChain.init(
+                        self.api,
+                        self.has_custom_shaders,
+                    );
+                    break :rebuild .{ &self.swap_chain.?, true };
+                };
 
             const size_changed =
                 self.size.screen.width != surface_size.width or
@@ -1347,25 +1758,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Conditions under which we need to draw the frame, otherwise we
             // don't need to since the previous frame should be identical.
+            //
+            // While any animation is in progress (a pending animation wake)
+            // every draw must actually render.
             const needs_redraw =
                 size_changed or
+                swap_chain_rebuilt or
                 self.cells_rebuilt or
-                self.hasAnimations() or
+                self.animationWake() != null or
                 sync;
 
             if (!needs_redraw) {
-                // We still need to present the last target again, because the
-                // apprt may be swapping buffers and display an outdated frame
-                // if we don't draw something new.
-                try self.api.presentLastTarget();
-                return;
+                // Ask our caller to resync the display link once the draw
+                // mutex is released, because we can probably pause the
+                // display link at this point.
+                return true;
             }
             self.cells_rebuilt = false;
 
             // Wait for a frame to be available.
-            const frame = try self.swap_chain.nextFrame();
-            errdefer self.swap_chain.releaseFrame();
-            // log.debug("drawing frame index={}", .{self.swap_chain.frame_index});
+            const frame = swap_chain.nextFrame();
+            errdefer swap_chain.releaseFrame();
+            // log.debug("drawing frame index={}", .{swap_chain.frame_index});
 
             // If we need to reinitialize our shaders, do so.
             if (self.reinitialize_shaders) {
@@ -1420,18 +1834,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Upload images to the GPU as necessary.
-            try self.uploadKittyImages();
+            _ = self.images.upload(self.alloc, &self.api);
 
             // Upload the background image to the GPU as necessary.
             try self.uploadBackgroundImage();
 
-            // Update custom shader uniforms if necessary.
-            try self.updateCustomShaderUniforms();
+            // Update per-frame custom shader uniforms.
+            try self.updateCustomShaderUniformsForFrame();
 
             // Setup our frame data
             try frame.uniforms.sync(&.{self.uniforms});
             try frame.cells_bg.sync(self.cells.bg_cells);
-            const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows.lists);
+            const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows);
 
             // If our background image buffer has changed, sync it.
             if (frame.bg_image_buffer_modified != self.bg_image_buffer_modified) {
@@ -1444,16 +1858,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             texture: {
                 const modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
                 if (modified <= frame.grayscale_modified) break :texture;
-                self.font_grid.lock.lockShared();
-                defer self.font_grid.lock.unlockShared();
+                self.font_grid.lock.lockSharedUncancelable(global.io());
+                defer self.font_grid.lock.unlockShared(global.io());
                 frame.grayscale_modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
                 try self.syncAtlasTexture(&self.font_grid.atlas_grayscale, &frame.grayscale);
             }
             texture: {
                 const modified = self.font_grid.atlas_color.modified.load(.monotonic);
                 if (modified <= frame.color_modified) break :texture;
-                self.font_grid.lock.lockShared();
-                defer self.font_grid.lock.unlockShared();
+                self.font_grid.lock.lockSharedUncancelable(global.io());
+                defer self.font_grid.lock.unlockShared(global.io());
                 frame.color_modified = self.font_grid.atlas_color.modified.load(.monotonic);
                 try self.syncAtlasTexture(&self.font_grid.atlas_color, &frame.color);
             }
@@ -1482,6 +1896,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 //       would require us to do color space conversion on the
                 //       CPU-side. In the future when we have utilities for
                 //       that we should remove this step and use clear_color.
+
                 if (self.bg_image) |img| switch (img) {
                     .ready => |texture| pass.step(.{
                         .pipeline = self.shaders.pipelines.bg_image,
@@ -1502,9 +1917,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Then we draw any kitty images that need
                 // to be behind text AND cell backgrounds.
-                try self.drawImagePlacements(
+                self.images.draw(
+                    &self.api,
+                    self.shaders.pipelines.image,
                     &pass,
-                    self.image_placements.items[0..self.image_bg_end],
+                    .kitty_below_bg,
                 );
 
                 // Then we draw any opaque cell backgrounds.
@@ -1516,9 +1933,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 });
 
                 // Kitty images between cell backgrounds and text.
-                try self.drawImagePlacements(
+                self.images.draw(
+                    &self.api,
+                    self.shaders.pipelines.image,
                     &pass,
-                    self.image_placements.items[self.image_bg_end..self.image_text_end],
+                    .kitty_below_text,
                 );
 
                 // Text.
@@ -1541,9 +1960,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 });
 
                 // Kitty images in front of text.
-                try self.drawImagePlacements(
+                self.images.draw(
+                    &self.api,
+                    self.shaders.pipelines.image,
                     &pass,
-                    self.image_placements.items[self.image_text_end..],
+                    .kitty_above_text,
+                );
+
+                // Debug overlay. We do this before any custom shader state
+                // because our debug overlay is aligned with the grid.
+                if (self.overlay != null) self.images.draw(
+                    &self.api,
+                    self.shaders.pipelines.image,
+                    &pass,
+                    .overlay,
                 );
             }
 
@@ -1576,6 +2006,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     });
                 }
             }
+
+            return false;
         }
 
         // Callback from the graphics API when a frame is completed.
@@ -1595,386 +2027,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }, .{ .forever = {} });
             }
 
-            // Always release our semaphore
-            self.swap_chain.releaseFrame();
-        }
-
-        fn drawImagePlacements(
-            self: *Self,
-            pass: *RenderPass,
-            placements: []const imagepkg.Placement,
-        ) !void {
-            if (placements.len == 0) return;
-
-            for (placements) |p| {
-
-                // Look up the image
-                const image = self.images.get(p.image_id) orelse {
-                    log.warn("image not found for placement image_id={}", .{p.image_id});
-                    continue;
-                };
-
-                // Get the texture
-                const texture = switch (image.image) {
-                    .ready,
-                    .unload_ready,
-                    => |t| t,
-                    else => {
-                        log.warn("image not ready for placement image_id={}", .{p.image_id});
-                        continue;
-                    },
-                };
-
-                // Create our vertex buffer, which is always exactly one item.
-                // future(mitchellh): we can group rendering multiple instances of a single image
-                var buf = try Buffer(shaderpkg.Image).initFill(
-                    self.api.imageBufferOptions(),
-                    &.{.{
-                        .grid_pos = .{
-                            @as(f32, @floatFromInt(p.x)),
-                            @as(f32, @floatFromInt(p.y)),
-                        },
-
-                        .cell_offset = .{
-                            @as(f32, @floatFromInt(p.cell_offset_x)),
-                            @as(f32, @floatFromInt(p.cell_offset_y)),
-                        },
-
-                        .source_rect = .{
-                            @as(f32, @floatFromInt(p.source_x)),
-                            @as(f32, @floatFromInt(p.source_y)),
-                            @as(f32, @floatFromInt(p.source_width)),
-                            @as(f32, @floatFromInt(p.source_height)),
-                        },
-
-                        .dest_size = .{
-                            @as(f32, @floatFromInt(p.width)),
-                            @as(f32, @floatFromInt(p.height)),
-                        },
-                    }},
-                );
-                defer buf.deinit();
-
-                pass.step(.{
-                    .pipeline = self.shaders.pipelines.image,
-                    .buffers = &.{buf.buffer},
-                    .textures = &.{texture},
-                    .draw = .{
-                        .type = .triangle_strip,
-                        .vertex_count = 4,
-                    },
-                });
-            }
-        }
-
-        /// This goes through the Kitty graphic placements and accumulates the
-        /// placements we need to render on our viewport.
-        fn prepKittyGraphics(
-            self: *Self,
-            t: *terminal.Terminal,
-        ) !void {
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
-
-            const storage = &t.screen.kitty_images;
-            defer storage.dirty = false;
-
-            // We always clear our previous placements no matter what because
-            // we rebuild them from scratch.
-            self.image_placements.clearRetainingCapacity();
-            self.image_virtual = false;
-
-            // Go through our known images and if there are any that are no longer
-            // in use then mark them to be freed.
-            //
-            // This never conflicts with the below because a placement can't
-            // reference an image that doesn't exist.
-            {
-                var it = self.images.iterator();
-                while (it.next()) |kv| {
-                    if (storage.imageById(kv.key_ptr.*) == null) {
-                        kv.value_ptr.image.markForUnload();
-                    }
-                }
-            }
-
-            // The top-left and bottom-right corners of our viewport in screen
-            // points. This lets us determine offsets and containment of placements.
-            const top = t.screen.pages.getTopLeft(.viewport);
-            const bot = t.screen.pages.getBottomRight(.viewport).?;
-            const top_y = t.screen.pages.pointFromPin(.screen, top).?.screen.y;
-            const bot_y = t.screen.pages.pointFromPin(.screen, bot).?.screen.y;
-
-            // Go through the placements and ensure the image is
-            // on the GPU or else is ready to be sent to the GPU.
-            var it = storage.placements.iterator();
-            while (it.next()) |kv| {
-                const p = kv.value_ptr;
-
-                // Special logic based on location
-                switch (p.location) {
-                    .pin => {},
-                    .virtual => {
-                        // We need to mark virtual placements on our renderer so that
-                        // we know to rebuild in more scenarios since cell changes can
-                        // now trigger placement changes.
-                        self.image_virtual = true;
-
-                        // We also continue out because virtual placements are
-                        // only triggered by the unicode placeholder, not by the
-                        // placement itself.
-                        continue;
-                    },
-                }
-
-                // Get the image for the placement
-                const image = storage.imageById(kv.key_ptr.image_id) orelse {
-                    log.warn(
-                        "missing image for placement, ignoring image_id={}",
-                        .{kv.key_ptr.image_id},
-                    );
-                    continue;
-                };
-
-                try self.prepKittyPlacement(t, top_y, bot_y, &image, p);
-            }
-
-            // If we have virtual placements then we need to scan for placeholders.
-            if (self.image_virtual) {
-                var v_it = terminal.kitty.graphics.unicode.placementIterator(top, bot);
-                while (v_it.next()) |virtual_p| try self.prepKittyVirtualPlacement(
-                    t,
-                    &virtual_p,
-                );
-            }
-
-            // Sort the placements by their Z value.
-            std.mem.sortUnstable(
-                imagepkg.Placement,
-                self.image_placements.items,
-                {},
-                struct {
-                    fn lessThan(
-                        ctx: void,
-                        lhs: imagepkg.Placement,
-                        rhs: imagepkg.Placement,
-                    ) bool {
-                        _ = ctx;
-                        return lhs.z < rhs.z or (lhs.z == rhs.z and lhs.image_id < rhs.image_id);
-                    }
-                }.lessThan,
-            );
-
-            // Find our indices. The values are sorted by z so we can
-            // find the first placement out of bounds to find the limits.
-            var bg_end: ?u32 = null;
-            var text_end: ?u32 = null;
-            const bg_limit = std.math.minInt(i32) / 2;
-            for (self.image_placements.items, 0..) |p, i| {
-                if (bg_end == null and p.z >= bg_limit) {
-                    bg_end = @intCast(i);
-                }
-                if (text_end == null and p.z >= 0) {
-                    text_end = @intCast(i);
-                }
-            }
-
-            // If we didn't see any images with a z > the bg limit,
-            // then our bg end is the end of our placement list.
-            self.image_bg_end =
-                bg_end orelse @intCast(self.image_placements.items.len);
-
-            // Same idea for the image_text_end.
-            self.image_text_end =
-                text_end orelse @intCast(self.image_placements.items.len);
-        }
-
-        fn prepKittyVirtualPlacement(
-            self: *Self,
-            t: *terminal.Terminal,
-            p: *const terminal.kitty.graphics.unicode.Placement,
-        ) !void {
-            const storage = &t.screen.kitty_images;
-            const image = storage.imageById(p.image_id) orelse {
-                log.warn(
-                    "missing image for virtual placement, ignoring image_id={}",
-                    .{p.image_id},
-                );
-                return;
-            };
-
-            const rp = p.renderPlacement(
-                storage,
-                &image,
-                self.grid_metrics.cell_width,
-                self.grid_metrics.cell_height,
-            ) catch |err| {
-                log.warn("error rendering virtual placement err={}", .{err});
-                return;
-            };
-
-            // If our placement is zero sized then we don't do anything.
-            if (rp.dest_width == 0 or rp.dest_height == 0) return;
-
-            const viewport: terminal.point.Point = t.screen.pages.pointFromPin(
-                .viewport,
-                rp.top_left,
-            ) orelse {
-                // This is unreachable with virtual placements because we should
-                // only ever be looking at virtual placements that are in our
-                // viewport in the renderer and virtual placements only ever take
-                // up one row.
-                unreachable;
-            };
-
-            // Prepare the image for the GPU and store the placement.
-            try self.prepKittyImage(&image);
-            try self.image_placements.append(self.alloc, .{
-                .image_id = image.id,
-                .x = @intCast(rp.top_left.x),
-                .y = @intCast(viewport.viewport.y),
-                .z = -1,
-                .width = rp.dest_width,
-                .height = rp.dest_height,
-                .cell_offset_x = rp.offset_x,
-                .cell_offset_y = rp.offset_y,
-                .source_x = rp.source_x,
-                .source_y = rp.source_y,
-                .source_width = rp.source_width,
-                .source_height = rp.source_height,
-            });
-        }
-
-        /// Get the viewport-relative position for this
-        /// placement and add it to the placements list.
-        fn prepKittyPlacement(
-            self: *Self,
-            t: *terminal.Terminal,
-            top_y: u32,
-            bot_y: u32,
-            image: *const terminal.kitty.graphics.Image,
-            p: *const terminal.kitty.graphics.ImageStorage.Placement,
-        ) !void {
-            // Get the rect for the placement. If this placement doesn't have
-            // a rect then its virtual or something so skip it.
-            const rect = p.rect(image.*, t) orelse return;
-
-            // This is expensive but necessary.
-            const img_top_y = t.screen.pages.pointFromPin(.screen, rect.top_left).?.screen.y;
-            const img_bot_y = t.screen.pages.pointFromPin(.screen, rect.bottom_right).?.screen.y;
-
-            // If the selection isn't within our viewport then skip it.
-            if (img_top_y > bot_y) return;
-            if (img_bot_y < top_y) return;
-
-            // We need to prep this image for upload if it isn't in the
-            // cache OR it is in the cache but the transmit time doesn't
-            // match meaning this image is different.
-            try self.prepKittyImage(image);
-
-            // Calculate the dimensions of our image, taking in to
-            // account the rows / columns specified by the placement.
-            const dest_size = p.calculatedSize(image.*, t);
-
-            // Calculate the source rectangle
-            const source_x = @min(image.width, p.source_x);
-            const source_y = @min(image.height, p.source_y);
-            const source_width = if (p.source_width > 0)
-                @min(image.width - source_x, p.source_width)
-            else
-                image.width;
-            const source_height = if (p.source_height > 0)
-                @min(image.height - source_y, p.source_height)
-            else
-                image.height;
-
-            // Get the viewport-relative Y position of the placement.
-            const y_pos: i32 = @as(i32, @intCast(img_top_y)) - @as(i32, @intCast(top_y));
-
-            // Accumulate the placement
-            if (dest_size.width > 0 and dest_size.height > 0) {
-                try self.image_placements.append(self.alloc, .{
-                    .image_id = image.id,
-                    .x = @intCast(rect.top_left.x),
-                    .y = y_pos,
-                    .z = p.z,
-                    .width = dest_size.width,
-                    .height = dest_size.height,
-                    .cell_offset_x = p.x_offset,
-                    .cell_offset_y = p.y_offset,
-                    .source_x = source_x,
-                    .source_y = source_y,
-                    .source_width = source_width,
-                    .source_height = source_height,
-                });
-            }
-        }
-
-        /// Prepare the provided image for upload to the GPU by copying its
-        /// data with our allocator and setting it to the pending state.
-        fn prepKittyImage(
-            self: *Self,
-            image: *const terminal.kitty.graphics.Image,
-        ) !void {
-            // If this image exists and its transmit time is the same we assume
-            // it is the identical image so we don't need to send it to the GPU.
-            const gop = try self.images.getOrPut(self.alloc, image.id);
-            if (gop.found_existing and
-                gop.value_ptr.transmit_time.order(image.transmit_time) == .eq)
-            {
-                return;
-            }
-
-            // Copy the data into the pending state.
-            const data = try self.alloc.dupe(u8, image.data);
-            errdefer self.alloc.free(data);
-
-            // Store it in the map
-            const pending: Image.Pending = .{
-                .width = image.width,
-                .height = image.height,
-                .pixel_format = switch (image.format) {
-                    .gray => .gray,
-                    .gray_alpha => .gray_alpha,
-                    .rgb => .rgb,
-                    .rgba => .rgba,
-                    .png => unreachable, // should be decoded by now
-                },
-                .data = data.ptr,
-            };
-
-            const new_image: Image = .{ .pending = pending };
-
-            if (!gop.found_existing) {
-                gop.value_ptr.* = .{
-                    .image = new_image,
-                    .transmit_time = undefined,
-                };
-            } else {
-                try gop.value_ptr.image.markForReplace(
-                    self.alloc,
-                    new_image,
-                );
-            }
-
-            try gop.value_ptr.image.prepForUpload(self.alloc);
-
-            gop.value_ptr.transmit_time = image.transmit_time;
-        }
-
-        /// Upload any images to the GPU that need to be uploaded,
-        /// and remove any images that are no longer needed on the GPU.
-        fn uploadKittyImages(self: *Self) !void {
-            var image_it = self.images.iterator();
-            while (image_it.next()) |kv| {
-                const img = &kv.value_ptr.image;
-                if (img.isUnloading()) {
-                    img.deinit(self.alloc);
-                    self.images.removeByPtr(kv.key_ptr);
-                    continue;
-                }
-                if (img.isPending()) try img.upload(self.alloc, &self.api);
-            }
+            // Always release our semaphore. The swap chain is
+            // guaranteed to exist here: it is only torn down after
+            // waiting for all in-flight frames to complete, and this
+            // callback is what signals that completion.
+            self.swap_chain.?.releaseFrame();
         }
 
         /// Call this any time the background image path changes.
@@ -1988,17 +2045,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 // Open the file
-                var file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+                var file = std.Io.Dir.openFileAbsolute(
+                    global.io(),
+                    path,
+                    .{},
+                ) catch |err| {
                     log.warn(
                         "error opening background image file \"{s}\": {}",
                         .{ path, err },
                     );
                     break :load_background;
                 };
-                defer file.close();
+                defer file.close(global.io());
 
                 // Read it
-                const contents = file.readToEndAlloc(
+                const contents = compat_file.readToEndAlloc(
+                    file,
                     self.alloc,
                     std.math.maxInt(u32), // Max size of 4 GiB, for now.
                 ) catch |err| {
@@ -2050,7 +2112,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we have an existing background image, replace it.
                 // Otherwise, set this as our background image directly.
                 if (self.bg_image) |*img| {
-                    try img.markForReplace(self.alloc, image);
+                    img.markForReplace(self.alloc, image);
                 } else {
                     self.bg_image = image;
                 }
@@ -2075,8 +2137,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Update the configuration.
         pub fn changeConfig(self: *Self, config: *DerivedConfig) !void {
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
 
             // We always redo the font shaper in case font features changed. We
             // could check to see if there was an actual config change but this is
@@ -2091,7 +2153,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // We also need to reset the shaper cache so shaper info
-            // from the previous font isn't re-used for the new font.
+            // from the previous font isn't reused for the new font.
             const font_shaper_cache = font.ShaperCache.init();
             self.font_shaper_cache.deinit(self.alloc);
             self.font_shaper_cache = font_shaper_cache;
@@ -2103,11 +2165,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.uniforms.bools.use_display_p3 = config.colorspace == .@"display-p3";
             self.uniforms.bools.use_linear_blending = config.blending.isLinear();
             self.uniforms.bools.use_linear_correction = config.blending == .@"linear-corrected";
-
-            // Set our new colors
-            self.default_background_color = config.background;
-            self.default_foreground_color = config.foreground;
-            self.default_cursor_color = config.cursor_color;
 
             const bg_image_config_changed =
                 self.config.bg_image_fit != config.bg_image_fit or
@@ -2137,7 +2194,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (bg_image_config_changed) self.updateBgImageBuffer();
 
             // Reset our viewport to force a rebuild, in case of a font change.
-            self.cells_viewport = null;
+            self.markDirty();
 
             const blending_changed = old_blending != config.blending;
 
@@ -2161,14 +2218,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             size: renderer.Size,
         ) void {
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
 
-            // We only actually need the padding from this,
-            // everything else is derived elsewhere.
-            self.size.padding = size.padding;
-
+            self.size = size;
             self.updateScreenSizeUniforms();
+
+            // Some graphics APIs need to manually update their viewport,
+            // like OpenGL. Do so here.
+            if (@hasDecl(GraphicsAPI, "setViewport")) {
+                self.api.setViewport(self.size.screen.width, self.size.screen.height);
+            }
 
             log.debug("screen size size={}", .{size});
         }
@@ -2245,14 +2305,108 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.bg_image_buffer_modified +%= 1;
         }
 
-        /// Update uniforms for the custom shaders, if necessary.
+        /// Update custom shader uniforms that depend on terminal state.
         ///
-        /// This should be called exactly once per frame, inside `drawFrame`.
-        fn updateCustomShaderUniforms(self: *Self) !void {
+        /// This should be called in `updateFrame` when terminal state changes.
+        fn updateCustomShaderUniformsFromState(self: *Self) void {
             // We only need to do this if we have custom shaders.
             if (!self.has_custom_shaders) return;
 
-            const now = try std.time.Instant.now();
+            // Only update when terminal state is dirty.
+            if (self.terminal_state.dirty == .false) return;
+
+            const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
+            const colors: *const terminal.RenderState.Colors = &self.terminal_state.colors;
+
+            // 256-color palette
+            for (colors.palette, 0..) |color, i| {
+                uniforms.palette[i] = .{
+                    @as(f32, @floatFromInt(color.r)) / 255.0,
+                    @as(f32, @floatFromInt(color.g)) / 255.0,
+                    @as(f32, @floatFromInt(color.b)) / 255.0,
+                    1.0,
+                };
+            }
+
+            // Background color
+            uniforms.background_color = .{
+                @as(f32, @floatFromInt(colors.background.r)) / 255.0,
+                @as(f32, @floatFromInt(colors.background.g)) / 255.0,
+                @as(f32, @floatFromInt(colors.background.b)) / 255.0,
+                1.0,
+            };
+
+            // Foreground color
+            uniforms.foreground_color = .{
+                @as(f32, @floatFromInt(colors.foreground.r)) / 255.0,
+                @as(f32, @floatFromInt(colors.foreground.g)) / 255.0,
+                @as(f32, @floatFromInt(colors.foreground.b)) / 255.0,
+                1.0,
+            };
+
+            // Cursor color
+            if (colors.cursor) |cursor_color| {
+                uniforms.cursor_color = .{
+                    @as(f32, @floatFromInt(cursor_color.r)) / 255.0,
+                    @as(f32, @floatFromInt(cursor_color.g)) / 255.0,
+                    @as(f32, @floatFromInt(cursor_color.b)) / 255.0,
+                    1.0,
+                };
+            }
+
+            // NOTE: the following could be optimized to follow a change in
+            // config for a slight optimization however this is only 12 bytes
+            // each being updated and likely isn't a cause for concern
+
+            // Cursor text color
+            if (self.config.cursor_text) |cursor_text| {
+                uniforms.cursor_text = .{
+                    @as(f32, @floatFromInt(cursor_text.color.r)) / 255.0,
+                    @as(f32, @floatFromInt(cursor_text.color.g)) / 255.0,
+                    @as(f32, @floatFromInt(cursor_text.color.b)) / 255.0,
+                    1.0,
+                };
+            }
+
+            // Selection background color
+            if (self.config.selection_background) |selection_bg| {
+                uniforms.selection_background_color = .{
+                    @as(f32, @floatFromInt(selection_bg.color.r)) / 255.0,
+                    @as(f32, @floatFromInt(selection_bg.color.g)) / 255.0,
+                    @as(f32, @floatFromInt(selection_bg.color.b)) / 255.0,
+                    1.0,
+                };
+            }
+
+            // Selection foreground color
+            if (self.config.selection_foreground) |selection_fg| {
+                uniforms.selection_foreground_color = .{
+                    @as(f32, @floatFromInt(selection_fg.color.r)) / 255.0,
+                    @as(f32, @floatFromInt(selection_fg.color.g)) / 255.0,
+                    @as(f32, @floatFromInt(selection_fg.color.b)) / 255.0,
+                    1.0,
+                };
+            }
+
+            // Cursor visibility
+            uniforms.cursor_visible = @intFromBool(self.terminal_state.cursor.visible);
+
+            // Cursor style
+            const cursor_style: renderer.CursorStyle = .fromTerminal(self.terminal_state.cursor.visual_style);
+            uniforms.previous_cursor_style = uniforms.current_cursor_style;
+            uniforms.current_cursor_style = @as(i32, @intFromEnum(cursor_style));
+        }
+
+        /// Update per-frame custom shader uniforms.
+        ///
+        /// This should be called exactly once per frame, inside `drawFrame`.
+        fn updateCustomShaderUniformsForFrame(self: *Self) !void {
+            // We only need to do this if we have custom shaders.
+            if (!self.has_custom_shaders) return;
+
+            const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
+
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
             defer self.last_frame_time = now;
             const first_frame_time = self.first_frame_time orelse t: {
                 self.first_frame_time = now;
@@ -2260,31 +2414,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
             const last_frame_time = self.last_frame_time orelse now;
 
-            const since_ns: f32 = @floatFromInt(now.since(first_frame_time));
-            self.custom_shader_uniforms.time = since_ns / std.time.ns_per_s;
+            const since_ns: f32 = @floatFromInt(first_frame_time.durationTo(now).nanoseconds);
+            uniforms.time = since_ns / std.time.ns_per_s;
 
-            const delta_ns: f32 = @floatFromInt(now.since(last_frame_time));
-            self.custom_shader_uniforms.time_delta = delta_ns / std.time.ns_per_s;
+            const delta_ns: f32 = @floatFromInt(last_frame_time.durationTo(now).nanoseconds);
+            uniforms.time_delta = delta_ns / std.time.ns_per_s;
 
-            self.custom_shader_uniforms.frame += 1;
+            uniforms.frame += 1;
 
             const screen = self.size.screen;
             const padding = self.size.padding;
             const cell = self.size.cell;
 
-            self.custom_shader_uniforms.resolution = .{
+            uniforms.resolution = .{
                 @floatFromInt(screen.width),
                 @floatFromInt(screen.height),
                 1,
             };
-            self.custom_shader_uniforms.channel_resolution[0] = .{
+            uniforms.channel_resolution[0] = .{
                 @floatFromInt(screen.width),
                 @floatFromInt(screen.height),
                 1,
                 0,
             };
 
-            // Update custom cursor uniforms, if we have a cursor.
             if (self.cells.getCursorGlyph()) |cursor| {
                 const cursor_width: f32 = @floatFromInt(cursor.glyph_size[0]);
                 const cursor_height: f32 = @floatFromInt(cursor.glyph_size[1]);
@@ -2342,8 +2495,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @as(f32, @floatFromInt(cursor.color[3])) / 255.0,
                 };
 
-                const uniforms = &self.custom_shader_uniforms;
-
                 const cursor_changed: bool =
                     !std.meta.eql(new_cursor, uniforms.current_cursor) or
                     !std.meta.eql(cursor_color, uniforms.current_cursor_color);
@@ -2356,70 +2507,110 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     uniforms.cursor_change_time = uniforms.time;
                 }
             }
+
+            // Update focus uniforms
+            uniforms.focus = @intFromBool(self.focused);
+
+            // If we need to update the time our focus state changed
+            // then update it to our current frame time. This may not be
+            // exactly correct since it is frame time, not exact focus
+            // time, but focus time on its own isn't exactly correct anyways
+            // since it comes async from a message.
+            if (self.custom_shader_focused_changed and self.focused) {
+                uniforms.time_focus = uniforms.time;
+                self.custom_shader_focused_changed = false;
+            }
         }
+
+        /// Build the overlay as configured. Returns null if there is no
+        /// overlay currently configured.
+        fn rebuildOverlay(
+            self: *Self,
+            features: []const Overlay.Feature,
+        ) Overlay.InitError!void {
+            const alloc = self.alloc;
+
+            // If we have no features enabled, don't build an overlay.
+            // If we had a previous overlay, deallocate it.
+            if (features.len == 0) {
+                if (self.overlay) |*old| {
+                    old.deinit(alloc);
+                    self.overlay = null;
+                }
+
+                return;
+            }
+
+            // If we had a previous overlay, clear it. Otherwise, init.
+            const overlay: *Overlay = overlay: {
+                if (self.overlay) |*v| existing: {
+                    // Verify that our overlay size matches our screen
+                    // size as we know it now. If not, deinit and reinit.
+                    // Note: these intCasts are always safe because z2d
+                    // stores as i32 but we always init with a u32.
+                    const width: u32 = @intCast(v.surface.getWidth());
+                    const height: u32 = @intCast(v.surface.getHeight());
+                    const term_size = self.size.terminal();
+                    if (width != term_size.width or
+                        height != term_size.height) break :existing;
+
+                    // We also depend on cell size.
+                    if (v.cell_size.width != self.size.cell.width or
+                        v.cell_size.height != self.size.cell.height) break :existing;
+
+                    // Everything matches, so we can just reset the surface
+                    // and redraw.
+                    v.reset();
+                    break :overlay v;
+                }
+
+                // If we reached this point we want to reset our overlay.
+                if (self.overlay) |*v| {
+                    v.deinit(alloc);
+                    self.overlay = null;
+                }
+
+                assert(self.overlay == null);
+                const new: Overlay = try .init(alloc, self.size);
+                self.overlay = new;
+                break :overlay &self.overlay.?;
+            };
+            overlay.applyFeatures(
+                alloc,
+                &self.terminal_state,
+                features,
+            );
+        }
+
+        const PreeditRange = struct {
+            y: terminal.size.CellCountInt,
+            x: [2]terminal.size.CellCountInt,
+            cp_offset: usize,
+        };
 
         /// Convert the terminal state to GPU cells stored in CPU memory. These
         /// are then synced to the GPU in the next frame. This only updates CPU
         /// memory and doesn't touch the GPU.
+        ///
+        /// This requires the draw mutex.
+        ///
+        /// Dirty state on terminal state won't be reset by this.
         fn rebuildCells(
             self: *Self,
-            wants_rebuild: bool,
-            screen: *terminal.Screen,
-            screen_type: terminal.ScreenType,
-            mouse: renderer.State.Mouse,
             preedit: ?renderer.State.Preedit,
             cursor_style_: ?renderer.CursorStyle,
-            color_palette: *const terminal.color.Palette,
-        ) !void {
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
-
-            // const start = try std.time.Instant.now();
-            // const start_micro = std.time.microTimestamp();
-            // defer {
-            //     const end = std.time.Instant.now() catch unreachable;
-            //     // "[rebuildCells time] <START us>\t<TIME_TAKEN us>"
-            //     std.log.warn("[rebuildCells time] {}\t{}", .{start_micro, end.since(start) / std.time.ns_per_us});
-            // }
-
-            _ = screen_type; // we might use this again later so not deleting it yet
-
-            // Create an arena for all our temporary allocations while rebuilding
-            var arena = ArenaAllocator.init(self.alloc);
-            defer arena.deinit();
-            const arena_alloc = arena.allocator();
-
-            // Create our match set for the links.
-            var link_match_set: link.MatchSet = if (mouse.point) |mouse_pt| try self.config.links.matchSet(
-                arena_alloc,
-                screen,
-                mouse_pt,
-                mouse.mods,
-            ) else .{};
-
-            // Determine our x/y range for preedit. We don't want to render anything
-            // here because we will render the preedit separately.
-            const preedit_range: ?struct {
-                y: terminal.size.CellCountInt,
-                x: [2]terminal.size.CellCountInt,
-                cp_offset: usize,
-            } = if (preedit) |preedit_v| preedit: {
-                const range = preedit_v.range(screen.cursor.x, screen.pages.cols - 1);
-                break :preedit .{
-                    .y = screen.cursor.y,
-                    .x = .{ range.start, range.end },
-                    .cp_offset = range.cp_offset,
-                };
-            } else null;
+            links: *const terminal.RenderState.CellSet,
+        ) Allocator.Error!void {
+            const state: *terminal.RenderState = &self.terminal_state;
 
             const grid_size_diff =
-                self.cells.size.rows != screen.pages.rows or
-                self.cells.size.columns != screen.pages.cols;
+                self.cells.size.rows != state.rows or
+                self.cells.size.columns != state.cols;
 
             if (grid_size_diff) {
                 var new_size = self.cells.size;
-                new_size.rows = screen.pages.rows;
-                new_size.columns = screen.pages.cols;
+                new_size.rows = state.rows;
+                new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
 
                 // Update our uniforms accordingly, otherwise
@@ -2427,8 +2618,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
 
-            const rebuild = wants_rebuild or grid_size_diff;
-
+            const rebuild = state.dirty == .full or grid_size_diff;
             if (rebuild) {
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
                 self.cells.reset();
@@ -2450,489 +2640,178 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // We rebuild the cells row-by-row because we
-            // do font shaping and dirty tracking by row.
-            var row_it = screen.pages.rowIterator(.left_up, .{ .viewport = .{} }, null);
+            // From this point on we never fail. We produce some kind of
+            // working terminal state, even if incorrect.
+            errdefer comptime unreachable;
+
+            // Get our row data from our state
+            const row_data = state.row_data.slice();
+            const row_raws = row_data.items(.raw);
+            const row_cells = row_data.items(.cells);
+            const row_dirty = row_data.items(.dirty);
+            const row_selection = row_data.items(.selection);
+            const row_highlights = row_data.items(.highlights);
+
             // If our cell contents buffer is shorter than the screen viewport,
             // we render the rows that fit, starting from the bottom. If instead
             // the viewport is shorter than the cell contents buffer, we align
             // the top of the viewport with the top of the contents buffer.
-            var y: terminal.size.CellCountInt = @min(
-                screen.pages.rows,
+            const row_len: usize = @min(
+                state.rows,
                 self.cells.size.rows,
             );
-            while (row_it.next()) |row| {
-                // The viewport may have more rows than our cell contents,
-                // so we need to break from the loop early if we hit y = 0.
-                if (y == 0) break;
 
-                y -= 1;
+            // Determine our x/y range for preedit. We don't want to render anything
+            // here because we will render the preedit separately.
+            const preedit_range: ?PreeditRange = if (preedit) |preedit_v| preedit: {
+                // We base the preedit on the position of the cursor in the
+                // viewport. If the cursor isn't visible in the viewport we
+                // don't show it.
+                const cursor_vp = state.cursor.viewport orelse
+                    break :preedit null;
+
+                // If our preedit row isn't dirty then we don't need the
+                // preedit range. This also avoids an issue later where we
+                // unconditionally add preedit cells when this is set.
+                if (!rebuild and !row_dirty[cursor_vp.y]) break :preedit null;
+
+                const range = preedit_v.range(
+                    cursor_vp.x,
+                    state.cols - 1,
+                );
+                break :preedit .{
+                    .y = @intCast(cursor_vp.y),
+                    .x = .{ range.start, range.end },
+                    .cp_offset = range.cp_offset,
+                };
+            } else null;
+
+            for (
+                0..,
+                row_raws[0..row_len],
+                row_cells[0..row_len],
+                row_dirty[0..row_len],
+                row_selection[0..row_len],
+                row_highlights[0..row_len],
+            ) |y_usize, row, *cells, *dirty, selection, *highlights| {
+                const y: terminal.size.CellCountInt = @intCast(y_usize);
 
                 if (!rebuild) {
                     // Only rebuild if we are doing a full rebuild or this row is dirty.
-                    if (!row.isDirty()) continue;
+                    if (!dirty.*) continue;
 
                     // Clear the cells if the row is dirty
                     self.cells.clear(y);
                 }
 
-                // True if we want to do font shaping around the cursor.
-                // We want to do font shaping as long as the cursor is enabled.
-                const shape_cursor = screen.viewportIsBottom() and
-                    y == screen.cursor.y;
+                // Unmark the dirty state in our render state.
+                dirty.* = false;
 
-                // We need to get this row's selection, if
-                // there is one, for proper run splitting.
-                const row_selection = sel: {
-                    const sel = screen.selection orelse break :sel null;
-                    const pin = screen.pages.pin(.{ .viewport = .{ .y = y } }) orelse
-                        break :sel null;
-                    break :sel sel.containedRow(screen, pin) orelse null;
+                self.rebuildRow(
+                    y,
+                    row,
+                    cells,
+                    preedit_range,
+                    selection,
+                    highlights,
+                    links,
+                ) catch |err| {
+                    // This should never happen except under exceptional
+                    // scenarios. In this case, we don't want to corrupt
+                    // our render state so just clear this row and keep
+                    // trying to finish it out.
+                    log.warn("error building row y={} err={}", .{ y, err });
+                    self.cells.clear(y);
                 };
-
-                // On primary screen, we still apply vertical padding
-                // extension under certain conditions we feel are safe.
-                //
-                // This helps make some scenarios look better while
-                // avoiding scenarios we know do NOT look good.
-                switch (self.config.padding_color) {
-                    // These already have the correct values set above.
-                    .background, .@"extend-always" => {},
-
-                    // Apply heuristics for padding extension.
-                    .extend => if (y == 0) {
-                        self.uniforms.padding_extend.up = !row.neverExtendBg(
-                            color_palette,
-                            self.background_color orelse self.default_background_color,
-                        );
-                    } else if (y == self.cells.size.rows - 1) {
-                        self.uniforms.padding_extend.down = !row.neverExtendBg(
-                            color_palette,
-                            self.background_color orelse self.default_background_color,
-                        );
-                    },
-                }
-
-                // Iterator of runs for shaping.
-                var run_iter_opts: font.shape.RunOptions = .{
-                    .grid = self.font_grid,
-                    .screen = screen,
-                    .row = row,
-                    .selection = row_selection,
-                    .cursor_x = if (shape_cursor) screen.cursor.x else null,
-                };
-                run_iter_opts.applyBreakConfig(self.config.font_shaping_break);
-                var run_iter = self.font_shaper.runIterator(run_iter_opts);
-                var shaper_run: ?font.shape.TextRun = try run_iter.next(self.alloc);
-                var shaper_cells: ?[]const font.shape.Cell = null;
-                var shaper_cells_i: usize = 0;
-
-                const row_cells_all = row.cells(.all);
-
-                // If our viewport is wider than our cell contents buffer,
-                // we still only process cells up to the width of the buffer.
-                const row_cells = row_cells_all[0..@min(row_cells_all.len, self.cells.size.columns)];
-
-                for (row_cells, 0..) |*cell, x| {
-                    // If this cell falls within our preedit range then we
-                    // skip this because preedits are setup separately.
-                    if (preedit_range) |range| preedit: {
-                        // We're not on the preedit line, no actions necessary.
-                        if (range.y != y) break :preedit;
-                        // We're before the preedit range, no actions necessary.
-                        if (x < range.x[0]) break :preedit;
-                        // We're in the preedit range, skip this cell.
-                        if (x <= range.x[1]) continue;
-                        // After exiting the preedit range we need to catch
-                        // the run position up because of the missed cells.
-                        // In all other cases, no action is necessary.
-                        if (x != range.x[1] + 1) break :preedit;
-
-                        // Step the run iterator until we find a run that ends
-                        // after the current cell, which will be the soonest run
-                        // that might contain glyphs for our cell.
-                        while (shaper_run) |run| {
-                            if (run.offset + run.cells > x) break;
-                            shaper_run = try run_iter.next(self.alloc);
-                            shaper_cells = null;
-                            shaper_cells_i = 0;
-                        }
-
-                        const run = shaper_run orelse break :preedit;
-
-                        // If we haven't shaped this run, do so now.
-                        shaper_cells = shaper_cells orelse
-                            // Try to read the cells from the shaping cache if we can.
-                            self.font_shaper_cache.get(run) orelse
-                            cache: {
-                                // Otherwise we have to shape them.
-                                const cells = try self.font_shaper.shape(run);
-
-                                // Try to cache them. If caching fails for any reason we
-                                // continue because it is just a performance optimization,
-                                // not a correctness issue.
-                                self.font_shaper_cache.put(
-                                    self.alloc,
-                                    run,
-                                    cells,
-                                ) catch |err| {
-                                    log.warn(
-                                        "error caching font shaping results err={}",
-                                        .{err},
-                                    );
-                                };
-
-                                // The cells we get from direct shaping are always owned
-                                // by the shaper and valid until the next shaping call so
-                                // we can safely use them.
-                                break :cache cells;
-                            };
-
-                        const cells = shaper_cells.?;
-
-                        // Advance our index until we reach or pass
-                        // our current x position in the shaper cells.
-                        while (run.offset + cells[shaper_cells_i].x < x) {
-                            shaper_cells_i += 1;
-                        }
-                    }
-
-                    const wide = cell.wide;
-
-                    const style = row.style(cell);
-
-                    const cell_pin: terminal.Pin = cell: {
-                        var copy = row;
-                        copy.x = @intCast(x);
-                        break :cell copy;
-                    };
-
-                    // True if this cell is selected
-                    const selected: bool = if (screen.selection) |sel|
-                        sel.contains(screen, .{
-                            .node = row.node,
-                            .y = row.y,
-                            .x = @intCast(
-                                // Spacer tails should show the selection
-                                // state of the wide cell they belong to.
-                                if (wide == .spacer_tail)
-                                    x -| 1
-                                else
-                                    x,
-                            ),
-                        })
-                    else
-                        false;
-
-                    // The `_style` suffixed values are the colors based on
-                    // the cell style (SGR), before applying any additional
-                    // configuration, inversions, selections, etc.
-                    const bg_style = style.bg(cell, color_palette);
-                    const fg_style = style.fg(.{
-                        .default = self.foreground_color orelse self.default_foreground_color,
-                        .palette = color_palette,
-                        .bold = self.config.bold_color,
-                    });
-
-                    // The final background color for the cell.
-                    const bg = bg: {
-                        if (selected) {
-                            // If we have an explicit selection background color
-                            // specified int he config, use that
-                            if (self.config.selection_background) |v| {
-                                break :bg switch (v) {
-                                    .color => |color| color.toTerminalRGB(),
-                                    .@"cell-foreground" => if (style.flags.inverse) bg_style else fg_style,
-                                    .@"cell-background" => if (style.flags.inverse) fg_style else bg_style,
-                                };
-                            }
-
-                            // If no configuration, then our selection background
-                            // is our foreground color.
-                            break :bg self.foreground_color orelse self.default_foreground_color;
-                        }
-
-                        // Not selected
-                        break :bg if (style.flags.inverse != isCovering(cell.codepoint()))
-                            // Two cases cause us to invert (use the fg color as the bg)
-                            // - The "inverse" style flag.
-                            // - A "covering" glyph; we use fg for bg in that
-                            //   case to help make sure that padding extension
-                            //   works correctly.
-                            //
-                            // If one of these is true (but not the other)
-                            // then we use the fg style color for the bg.
-                            fg_style
-                        else
-                            // Otherwise they cancel out.
-                            bg_style;
-                    };
-
-                    const fg = fg: {
-                        // Our happy-path non-selection background color
-                        // is our style or our configured defaults.
-                        const final_bg = bg_style orelse
-                            self.background_color orelse
-                            self.default_background_color;
-
-                        // Whether we need to use the bg color as our fg color:
-                        // - Cell is selected, inverted, and set to cell-foreground
-                        // - Cell is selected, not inverted, and set to cell-background
-                        // - Cell is inverted and not selected
-                        if (selected) {
-                            // Use the selection foreground if set
-                            if (self.config.selection_foreground) |v| {
-                                break :fg switch (v) {
-                                    .color => |color| color.toTerminalRGB(),
-                                    .@"cell-foreground" => if (style.flags.inverse) final_bg else fg_style,
-                                    .@"cell-background" => if (style.flags.inverse) fg_style else final_bg,
-                                };
-                            }
-
-                            break :fg self.background_color orelse self.default_background_color;
-                        }
-
-                        break :fg if (style.flags.inverse)
-                            final_bg
-                        else
-                            fg_style;
-                    };
-
-                    // Foreground alpha for this cell.
-                    const alpha: u8 = if (style.flags.faint) self.config.faint_opacity else 255;
-
-                    // Set the cell's background color.
-                    {
-                        const rgb = bg orelse self.background_color orelse self.default_background_color;
-
-                        // Determine our background alpha. If we have transparency configured
-                        // then this is dynamic depending on some situations. This is all
-                        // in an attempt to make transparency look the best for various
-                        // situations. See inline comments.
-                        const bg_alpha: u8 = bg_alpha: {
-                            const default: u8 = 255;
-
-                            // Cells that are selected should be fully opaque.
-                            if (selected) break :bg_alpha default;
-
-                            // Cells that are reversed should be fully opaque.
-                            if (style.flags.inverse) break :bg_alpha default;
-
-                            // If the user requested to have opacity on all cells, apply it.
-                            if (self.config.background_opacity_cells and bg_style != null) {
-                                var opacity: f64 = @floatFromInt(default);
-                                opacity *= self.config.background_opacity;
-                                break :bg_alpha @intFromFloat(opacity);
-                            }
-
-                            // Cells that have an explicit bg color should be fully opaque.
-                            if (bg_style != null) break :bg_alpha default;
-
-                            // Otherwise, we won't draw the bg for this cell,
-                            // we'll let the already-drawn background color
-                            // show through.
-                            break :bg_alpha 0;
-                        };
-
-                        self.cells.bgCell(y, x).* = .{
-                            rgb.r, rgb.g, rgb.b, bg_alpha,
-                        };
-                    }
-
-                    // If the invisible flag is set on this cell then we
-                    // don't need to render any foreground elements, so
-                    // we just skip all glyphs with this x coordinate.
-                    //
-                    // NOTE: This behavior matches xterm. Some other terminal
-                    // emulators, e.g. Alacritty, still render text decorations
-                    // and only make the text itself invisible. The decision
-                    // has been made here to match xterm's behavior for this.
-                    if (style.flags.invisible) {
-                        continue;
-                    }
-
-                    // Give links a single underline, unless they already have
-                    // an underline, in which case use a double underline to
-                    // distinguish them.
-                    const underline: terminal.Attribute.Underline = if (link_match_set.contains(screen, cell_pin))
-                        if (style.flags.underline == .single)
-                            .double
-                        else
-                            .single
-                    else
-                        style.flags.underline;
-
-                    // We draw underlines first so that they layer underneath text.
-                    // This improves readability when a colored underline is used
-                    // which intersects parts of the text (descenders).
-                    if (underline != .none) self.addUnderline(
-                        @intCast(x),
-                        @intCast(y),
-                        underline,
-                        style.underlineColor(color_palette) orelse fg,
-                        alpha,
-                    ) catch |err| {
-                        log.warn(
-                            "error adding underline to cell, will be invalid x={} y={}, err={}",
-                            .{ x, y, err },
-                        );
-                    };
-
-                    if (style.flags.overline) self.addOverline(@intCast(x), @intCast(y), fg, alpha) catch |err| {
-                        log.warn(
-                            "error adding overline to cell, will be invalid x={} y={}, err={}",
-                            .{ x, y, err },
-                        );
-                    };
-
-                    // If we're at or past the end of our shaper run then
-                    // we need to get the next run from the run iterator.
-                    if (shaper_cells != null and shaper_cells_i >= shaper_cells.?.len) {
-                        shaper_run = try run_iter.next(self.alloc);
-                        shaper_cells = null;
-                        shaper_cells_i = 0;
-                    }
-
-                    if (shaper_run) |run| glyphs: {
-                        // If we haven't shaped this run yet, do so.
-                        shaper_cells = shaper_cells orelse
-                            // Try to read the cells from the shaping cache if we can.
-                            self.font_shaper_cache.get(run) orelse
-                            cache: {
-                                // Otherwise we have to shape them.
-                                const cells = try self.font_shaper.shape(run);
-
-                                // Try to cache them. If caching fails for any reason we
-                                // continue because it is just a performance optimization,
-                                // not a correctness issue.
-                                self.font_shaper_cache.put(
-                                    self.alloc,
-                                    run,
-                                    cells,
-                                ) catch |err| {
-                                    log.warn(
-                                        "error caching font shaping results err={}",
-                                        .{err},
-                                    );
-                                };
-
-                                // The cells we get from direct shaping are always owned
-                                // by the shaper and valid until the next shaping call so
-                                // we can safely use them.
-                                break :cache cells;
-                            };
-
-                        const cells = shaper_cells orelse break :glyphs;
-
-                        // If there are no shaper cells for this run, ignore it.
-                        // This can occur for runs of empty cells, and is fine.
-                        if (cells.len == 0) break :glyphs;
-
-                        // If we encounter a shaper cell to the left of the current
-                        // cell then we have some problems. This logic relies on x
-                        // position monotonically increasing.
-                        assert(run.offset + cells[shaper_cells_i].x >= x);
-
-                        // NOTE: An assumption is made here that a single cell will never
-                        // be present in more than one shaper run. If that assumption is
-                        // violated, this logic breaks.
-
-                        while (shaper_cells_i < cells.len and run.offset + cells[shaper_cells_i].x == x) : ({
-                            shaper_cells_i += 1;
-                        }) {
-                            self.addGlyph(
-                                @intCast(x),
-                                @intCast(y),
-                                cell_pin,
-                                cells[shaper_cells_i],
-                                shaper_run.?,
-                                fg,
-                                alpha,
-                            ) catch |err| {
-                                log.warn(
-                                    "error adding glyph to cell, will be invalid x={} y={}, err={}",
-                                    .{ x, y, err },
-                                );
-                            };
-                        }
-                    }
-
-                    // Finally, draw a strikethrough if necessary.
-                    if (style.flags.strikethrough) self.addStrikethrough(
-                        @intCast(x),
-                        @intCast(y),
-                        fg,
-                        alpha,
-                    ) catch |err| {
-                        log.warn(
-                            "error adding strikethrough to cell, will be invalid x={} y={}, err={}",
-                            .{ x, y, err },
-                        );
-                    };
-                }
             }
 
             // Setup our cursor rendering information.
             cursor: {
-                // By default, we don't handle cursor inversion on the shader.
+                // Clear our cursor by default.
                 self.cells.setCursor(null, null);
                 self.uniforms.cursor_pos = .{
                     std.math.maxInt(u16),
                     std.math.maxInt(u16),
                 };
 
+                // If the cursor isn't visible on the viewport, don't show
+                // a cursor. Otherwise, get our cursor cell, because we may
+                // need it for styling.
+                const cursor_vp = state.cursor.viewport orelse break :cursor;
+                const cursor_style: terminal.Style = cursor_style: {
+                    const cells = state.row_data.items(.cells);
+                    const cell = cells[cursor_vp.y].get(cursor_vp.x);
+                    break :cursor_style if (cell.raw.hasStyling())
+                        cell.style
+                    else
+                        .{};
+                };
+
                 // If we have preedit text, we don't setup a cursor
                 if (preedit != null) break :cursor;
 
-                // Prepare the cursor cell contents.
+                // If there isn't a cursor visual style requested then
+                // we don't render a cursor.
                 const style = cursor_style_ orelse break :cursor;
+
+                // Determine the cursor color.
                 const cursor_color = cursor_color: {
                     // If an explicit cursor color was set by OSC 12, use that.
-                    if (self.cursor_color) |v| break :cursor_color v;
+                    if (state.colors.cursor) |v| break :cursor_color v;
 
                     // Use our configured color if specified
-                    if (self.default_cursor_color) |v| switch (v) {
+                    if (self.config.cursor_color) |v| switch (v) {
                         .color => |color| break :cursor_color color.toTerminalRGB(),
+
                         inline .@"cell-foreground",
                         .@"cell-background",
                         => |_, tag| {
-                            const sty = screen.cursor.page_pin.style(screen.cursor.page_cell);
-                            const fg_style = sty.fg(.{
-                                .default = self.foreground_color orelse self.default_foreground_color,
-                                .palette = color_palette,
+                            const fg_style = cursor_style.fg(.{
+                                .default = state.colors.foreground,
+                                .palette = &state.colors.palette,
                                 .bold = self.config.bold_color,
                             });
-                            const bg_style = sty.bg(
-                                screen.cursor.page_cell,
-                                color_palette,
-                            ) orelse self.background_color orelse self.default_background_color;
+                            const bg_style = cursor_style.bg(
+                                &state.cursor.cell,
+                                &state.colors.palette,
+                            ) orelse state.colors.background;
 
                             break :cursor_color switch (tag) {
                                 .color => unreachable,
-                                .@"cell-foreground" => if (sty.flags.inverse) bg_style else fg_style,
-                                .@"cell-background" => if (sty.flags.inverse) fg_style else bg_style,
+                                .@"cell-foreground" => if (cursor_style.flags.inverse)
+                                    bg_style
+                                else
+                                    fg_style,
+                                .@"cell-background" => if (cursor_style.flags.inverse)
+                                    fg_style
+                                else
+                                    bg_style,
                             };
                         },
                     };
 
-                    break :cursor_color self.foreground_color orelse self.default_foreground_color;
+                    break :cursor_color state.colors.foreground;
                 };
 
-                self.addCursor(screen, style, cursor_color);
+                self.addCursor(
+                    &state.cursor,
+                    style,
+                    cursor_color,
+                );
 
                 // If the cursor is visible then we set our uniforms.
-                if (style == .block and screen.viewportIsBottom()) {
-                    const wide = screen.cursor.page_cell.wide;
+                if (style == .block) {
+                    const wide = state.cursor.cell.wide;
 
                     self.uniforms.cursor_pos = .{
                         // If we are a spacer tail of a wide cell, our cursor needs
                         // to move back one cell. The saturate is to ensure we don't
                         // overflow but this shouldn't happen with well-formed input.
                         switch (wide) {
-                            .narrow, .spacer_head, .wide => screen.cursor.x,
-                            .spacer_tail => screen.cursor.x -| 1,
+                            .narrow, .spacer_head, .wide => cursor_vp.x,
+                            .spacer_tail => cursor_vp.x -| 1,
                         },
-                        screen.cursor.y,
+                        @intCast(cursor_vp.y),
                     };
 
                     self.uniforms.bools.cursor_wide = switch (wide) {
@@ -2948,21 +2827,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             break :blk txt.color.toTerminalRGB();
                         }
 
-                        const sty = screen.cursor.page_pin.style(screen.cursor.page_cell);
-                        const fg_style = sty.fg(.{
-                            .default = self.foreground_color orelse self.default_foreground_color,
-                            .palette = color_palette,
+                        const fg_style = cursor_style.fg(.{
+                            .default = state.colors.foreground,
+                            .palette = &state.colors.palette,
                             .bold = self.config.bold_color,
                         });
-                        const bg_style = sty.bg(screen.cursor.page_cell, color_palette) orelse self.background_color orelse self.default_background_color;
+                        const bg_style = cursor_style.bg(
+                            &state.cursor.cell,
+                            &state.colors.palette,
+                        ) orelse state.colors.background;
 
                         break :blk switch (txt) {
                             // If the cell is reversed, use the opposite cell color instead.
-                            .@"cell-foreground" => if (sty.flags.inverse) bg_style else fg_style,
-                            .@"cell-background" => if (sty.flags.inverse) fg_style else bg_style,
+                            .@"cell-foreground" => if (cursor_style.flags.inverse)
+                                bg_style
+                            else
+                                fg_style,
+                            .@"cell-background" => if (cursor_style.flags.inverse)
+                                fg_style
+                            else
+                                bg_style,
                             else => unreachable,
                         };
-                    } else self.background_color orelse self.default_background_color;
+                    } else state.colors.background;
 
                     self.uniforms.cursor_color = .{
                         uniform_color.r,
@@ -2974,11 +2861,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Setup our preedit text.
-            if (preedit) |preedit_v| {
-                const range = preedit_range.?;
+            if (preedit) |preedit_v| preedit: {
+                const range = preedit_range orelse break :preedit;
                 var x = range.x[0];
                 for (preedit_v.codepoints[range.cp_offset..]) |cp| {
-                    self.addPreeditCell(cp, .{ .x = x, .y = range.y }) catch |err| {
+                    self.addPreeditCell(
+                        cp,
+                        .{ .x = x, .y = range.y },
+                        state.colors.foreground,
+                    ) catch |err| {
                         log.warn("error building preedit cell, will be invalid x={} y={}, err={}", .{
                             x,
                             range.y,
@@ -2997,6 +2888,454 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // log.debug("rebuildCells complete cached_runs={}", .{
             //     self.font_shaper_cache.count(),
             // });
+        }
+
+        fn rebuildRow(
+            self: *Self,
+            y: terminal.size.CellCountInt,
+            row: terminal.page.Row,
+            cells: *std.MultiArrayList(terminal.RenderState.Cell),
+            preedit_range: ?PreeditRange,
+            selection: ?[2]terminal.size.CellCountInt,
+            highlights: *const std.ArrayList(terminal.RenderState.Highlight),
+            links: *const terminal.RenderState.CellSet,
+        ) !void {
+            const state = &self.terminal_state;
+
+            // If our viewport is wider than our cell contents buffer,
+            // we still only process cells up to the width of the buffer.
+            const cells_slice = cells.slice();
+            const cells_len = @min(cells_slice.len, self.cells.size.columns);
+            const cells_raw = cells_slice.items(.raw);
+            const cells_style = cells_slice.items(.style);
+
+            // On primary screen, we still apply vertical padding
+            // extension under certain conditions we feel are safe.
+            //
+            // This helps make some scenarios look better while
+            // avoiding scenarios we know do NOT look good.
+            switch (self.config.padding_color) {
+                // These already have the correct values set above.
+                .background, .@"extend-always" => {},
+
+                // Apply heuristics for padding extension.
+                .extend => if (y == 0) {
+                    self.uniforms.padding_extend.up = !rowNeverExtendBg(
+                        row,
+                        cells_raw,
+                        cells_style,
+                        &state.colors.palette,
+                        state.colors.background,
+                    );
+                } else if (y == self.cells.size.rows - 1) {
+                    self.uniforms.padding_extend.down = !rowNeverExtendBg(
+                        row,
+                        cells_raw,
+                        cells_style,
+                        &state.colors.palette,
+                        state.colors.background,
+                    );
+                },
+            }
+
+            // Iterator of runs for shaping.
+            var run_iter_opts: font.shape.RunOptions = .{
+                .grid = self.font_grid,
+                .cells = cells_slice,
+                .selection = if (selection) |s| s else null,
+
+                // We want to do font shaping as long as the cursor is
+                // visible on this viewport.
+                .cursor_x = cursor_x: {
+                    const vp = state.cursor.viewport orelse break :cursor_x null;
+                    if (vp.y != y) break :cursor_x null;
+                    break :cursor_x vp.x;
+                },
+            };
+            run_iter_opts.applyBreakConfig(self.config.font_shaping_break);
+            var run_iter = self.font_shaper.runIterator(run_iter_opts);
+            var shaper_run: ?font.shape.TextRun = try run_iter.next(self.alloc);
+            var shaper_cells: ?[]const font.shape.Cell = null;
+            var shaper_cells_i: usize = 0;
+
+            for (
+                0..,
+                cells_raw[0..cells_len],
+                cells_style[0..cells_len],
+            ) |x, *cell, *managed_style| {
+                // If this cell falls within our preedit range then we
+                // skip this because preedits are setup separately.
+                if (preedit_range) |range| preedit: {
+                    // We're not on the preedit line, no actions necessary.
+                    if (range.y != y) break :preedit;
+                    // We're before the preedit range, no actions necessary.
+                    if (x < range.x[0]) break :preedit;
+                    // We're in the preedit range, skip this cell.
+                    if (x <= range.x[1]) continue;
+                    // After exiting the preedit range we need to catch
+                    // the run position up because of the missed cells.
+                    // In all other cases, no action is necessary.
+                    if (x != range.x[1] + 1) break :preedit;
+
+                    // Step the run iterator until we find a run that ends
+                    // after the current cell, which will be the soonest run
+                    // that might contain glyphs for our cell.
+                    while (shaper_run) |run| {
+                        if (run.offset + run.cells > x) break;
+                        shaper_run = try run_iter.next(self.alloc);
+                        shaper_cells = null;
+                        shaper_cells_i = 0;
+                    }
+
+                    const run = shaper_run orelse break :preedit;
+
+                    // If we haven't shaped this run, do so now.
+                    shaper_cells = shaper_cells orelse
+                        // Try to read the cells from the shaping cache if we can.
+                        self.font_shaper_cache.get(run) orelse
+                        cache: {
+                            // Otherwise we have to shape them.
+                            const new_cells = try self.font_shaper.shape(run);
+
+                            // Try to cache them. If caching fails for any reason we
+                            // continue because it is just a performance optimization,
+                            // not a correctness issue.
+                            self.font_shaper_cache.put(
+                                self.alloc,
+                                run,
+                                new_cells,
+                            ) catch |err| {
+                                log.warn(
+                                    "error caching font shaping results err={}",
+                                    .{err},
+                                );
+                            };
+
+                            // The cells we get from direct shaping are always owned
+                            // by the shaper and valid until the next shaping call so
+                            // we can safely use them.
+                            break :cache new_cells;
+                        };
+
+                    // Advance our index until we reach or pass
+                    // our current x position in the shaper cells.
+                    const shaper_cells_unwrapped = shaper_cells.?;
+                    while (run.offset + shaper_cells_unwrapped[shaper_cells_i].x < x) {
+                        shaper_cells_i += 1;
+                    }
+                }
+
+                const wide = cell.wide;
+                const style: terminal.Style = if (cell.hasStyling())
+                    managed_style.*
+                else
+                    .{};
+
+                // True if this cell is selected
+                const selected: enum {
+                    false,
+                    selection,
+                    search,
+                    search_selected,
+                } = selected: {
+                    // Order below matters for precedence.
+
+                    // Selection should take the highest precedence.
+                    const x_compare = if (wide == .spacer_tail)
+                        x -| 1
+                    else
+                        x;
+                    if (selection) |sel| {
+                        if (x_compare >= sel[0] and
+                            x_compare <= sel[1]) break :selected .selection;
+                    }
+
+                    // If we're highlighted, then we're selected. In the
+                    // future we want to use a different style for this
+                    // but this to get started.
+                    for (highlights.items) |hl| {
+                        if (x_compare >= hl.range[0] and
+                            x_compare <= hl.range[1])
+                        {
+                            const tag: HighlightTag = @enumFromInt(hl.tag);
+                            break :selected switch (tag) {
+                                .search_match => .search,
+                                .search_match_selected => .search_selected,
+                            };
+                        }
+                    }
+
+                    break :selected .false;
+                };
+
+                // The `_style` suffixed values are the colors based on
+                // the cell style (SGR), before applying any additional
+                // configuration, inversions, selections, etc.
+                const bg_style = style.bg(
+                    cell,
+                    &state.colors.palette,
+                );
+                const fg_style = style.fg(.{
+                    .default = state.colors.foreground,
+                    .palette = &state.colors.palette,
+                    .bold = self.config.bold_color,
+                });
+
+                // The final background color for the cell.
+                const bg = switch (selected) {
+                    // If we have an explicit selection background color
+                    // specified in the config, use that.
+                    //
+                    // If no configuration, then our selection background
+                    // is our foreground color.
+                    .selection => if (self.config.selection_background) |v| switch (v) {
+                        .color => |color| color.toTerminalRGB(),
+                        .@"cell-foreground" => if (style.flags.inverse) bg_style else fg_style,
+                        .@"cell-background" => if (style.flags.inverse) fg_style else bg_style,
+                    } else state.colors.foreground,
+
+                    .search => switch (self.config.search_background) {
+                        .color => |color| color.toTerminalRGB(),
+                        .@"cell-foreground" => if (style.flags.inverse) bg_style else fg_style,
+                        .@"cell-background" => if (style.flags.inverse) fg_style else bg_style,
+                    },
+
+                    .search_selected => switch (self.config.search_selected_background) {
+                        .color => |color| color.toTerminalRGB(),
+                        .@"cell-foreground" => if (style.flags.inverse) bg_style else fg_style,
+                        .@"cell-background" => if (style.flags.inverse) fg_style else bg_style,
+                    },
+
+                    // Not selected
+                    .false => if (style.flags.inverse != isCovering(cell.codepoint()))
+                        // Two cases cause us to invert (use the fg color as the bg)
+                        // - The "inverse" style flag.
+                        // - A "covering" glyph; we use fg for bg in that
+                        //   case to help make sure that padding extension
+                        //   works correctly.
+                        //
+                        // If one of these is true (but not the other)
+                        // then we use the fg style color for the bg.
+                        fg_style
+                    else
+                        // Otherwise they cancel out.
+                        bg_style,
+                };
+
+                const fg = fg: {
+                    // Our happy-path non-selection background color
+                    // is our style or our configured defaults.
+                    const final_bg = bg_style orelse state.colors.background;
+
+                    // Whether we need to use the bg color as our fg color:
+                    // - Cell is selected, inverted, and set to cell-foreground
+                    // - Cell is selected, not inverted, and set to cell-background
+                    // - Cell is inverted and not selected
+                    break :fg switch (selected) {
+                        .selection => if (self.config.selection_foreground) |v| switch (v) {
+                            .color => |color| color.toTerminalRGB(),
+                            .@"cell-foreground" => if (style.flags.inverse) final_bg else fg_style,
+                            .@"cell-background" => if (style.flags.inverse) fg_style else final_bg,
+                        } else state.colors.background,
+
+                        .search => switch (self.config.search_foreground) {
+                            .color => |color| color.toTerminalRGB(),
+                            .@"cell-foreground" => if (style.flags.inverse) final_bg else fg_style,
+                            .@"cell-background" => if (style.flags.inverse) fg_style else final_bg,
+                        },
+
+                        .search_selected => switch (self.config.search_selected_foreground) {
+                            .color => |color| color.toTerminalRGB(),
+                            .@"cell-foreground" => if (style.flags.inverse) final_bg else fg_style,
+                            .@"cell-background" => if (style.flags.inverse) fg_style else final_bg,
+                        },
+
+                        .false => if (style.flags.inverse)
+                            final_bg
+                        else
+                            fg_style,
+                    };
+                };
+
+                // Foreground alpha for this cell.
+                const alpha: u8 = if (style.flags.faint) self.config.faint_opacity else 255;
+
+                // Set the cell's background color.
+                {
+                    const rgb = bg orelse state.colors.background;
+
+                    // Determine our background alpha. If we have transparency configured
+                    // then this is dynamic depending on some situations. This is all
+                    // in an attempt to make transparency look the best for various
+                    // situations. See inline comments.
+                    const bg_alpha: u8 = bg_alpha: {
+                        const default: u8 = 255;
+
+                        // Cells that are selected should be fully opaque.
+                        if (selected != .false) break :bg_alpha default;
+
+                        // Cells that are reversed should be fully opaque.
+                        if (style.flags.inverse) break :bg_alpha default;
+
+                        // If the user requested to have opacity on all cells, apply it.
+                        if (self.config.background_opacity_cells and bg_style != null) {
+                            var opacity: f64 = @floatFromInt(default);
+                            opacity *= self.config.background_opacity;
+                            break :bg_alpha @intFromFloat(opacity);
+                        }
+
+                        // Cells that have an explicit bg color should be fully opaque.
+                        if (bg_style != null) break :bg_alpha default;
+
+                        // Otherwise, we won't draw the bg for this cell,
+                        // we'll let the already-drawn background color
+                        // show through.
+                        break :bg_alpha 0;
+                    };
+
+                    self.cells.bgCell(y, x).* = .{
+                        rgb.r, rgb.g, rgb.b, bg_alpha,
+                    };
+                }
+
+                // If the invisible flag is set on this cell then we
+                // don't need to render any foreground elements, so
+                // we just skip all glyphs with this x coordinate.
+                //
+                // NOTE: This behavior matches xterm. Some other terminal
+                // emulators, e.g. Alacritty, still render text decorations
+                // and only make the text itself invisible. The decision
+                // has been made here to match xterm's behavior for this.
+                if (style.flags.invisible) {
+                    continue;
+                }
+
+                // Give links a single underline, unless they already have
+                // an underline, in which case use a double underline to
+                // distinguish them.
+                const underline: terminal.Attribute.Underline = underline: {
+                    if (links.contains(.{
+                        .x = @intCast(x),
+                        .y = @intCast(y),
+                    })) {
+                        break :underline if (style.flags.underline == .single)
+                            .double
+                        else
+                            .single;
+                    }
+                    break :underline style.flags.underline;
+                };
+
+                // We draw underlines first so that they layer underneath text.
+                // This improves readability when a colored underline is used
+                // which intersects parts of the text (descenders).
+                if (underline != .none) self.addUnderline(
+                    @intCast(x),
+                    @intCast(y),
+                    underline,
+                    style.underlineColor(&state.colors.palette) orelse fg,
+                    alpha,
+                ) catch |err| {
+                    log.warn(
+                        "error adding underline to cell, will be invalid x={} y={}, err={}",
+                        .{ x, y, err },
+                    );
+                };
+
+                if (style.flags.overline) self.addOverline(@intCast(x), @intCast(y), fg, alpha) catch |err| {
+                    log.warn(
+                        "error adding overline to cell, will be invalid x={} y={}, err={}",
+                        .{ x, y, err },
+                    );
+                };
+
+                // If we're at or past the end of our shaper run then
+                // we need to get the next run from the run iterator.
+                if (shaper_cells != null and shaper_cells_i >= shaper_cells.?.len) {
+                    shaper_run = try run_iter.next(self.alloc);
+                    shaper_cells = null;
+                    shaper_cells_i = 0;
+                }
+
+                if (shaper_run) |run| glyphs: {
+                    // If we haven't shaped this run yet, do so.
+                    shaper_cells = shaper_cells orelse
+                        // Try to read the cells from the shaping cache if we can.
+                        self.font_shaper_cache.get(run) orelse
+                        cache: {
+                            // Otherwise we have to shape them.
+                            const new_cells = try self.font_shaper.shape(run);
+
+                            // Try to cache them. If caching fails for any reason we
+                            // continue because it is just a performance optimization,
+                            // not a correctness issue.
+                            self.font_shaper_cache.put(
+                                self.alloc,
+                                run,
+                                new_cells,
+                            ) catch |err| {
+                                log.warn(
+                                    "error caching font shaping results err={}",
+                                    .{err},
+                                );
+                            };
+
+                            // The cells we get from direct shaping are always owned
+                            // by the shaper and valid until the next shaping call so
+                            // we can safely use them.
+                            break :cache new_cells;
+                        };
+
+                    const shaped_cells = shaper_cells orelse break :glyphs;
+
+                    // If there are no shaper cells for this run, ignore it.
+                    // This can occur for runs of empty cells, and is fine.
+                    if (shaped_cells.len == 0) break :glyphs;
+
+                    // If we encounter a shaper cell to the left of the current
+                    // cell then we have some problems. This logic relies on x
+                    // position monotonically increasing.
+                    assert(run.offset + shaped_cells[shaper_cells_i].x >= x);
+
+                    // NOTE: An assumption is made here that a single cell will never
+                    // be present in more than one shaper run. If that assumption is
+                    // violated, this logic breaks.
+
+                    while (shaper_cells_i < shaped_cells.len and
+                        run.offset + shaped_cells[shaper_cells_i].x == x) : ({
+                        shaper_cells_i += 1;
+                    }) {
+                        self.addGlyph(
+                            @intCast(x),
+                            @intCast(y),
+                            state.cols,
+                            cells_raw,
+                            shaped_cells[shaper_cells_i],
+                            shaper_run.?,
+                            fg,
+                            alpha,
+                        ) catch |err| {
+                            log.warn(
+                                "error adding glyph to cell, will be invalid x={} y={}, err={}",
+                                .{ x, y, err },
+                            );
+                        };
+                    }
+                }
+
+                // Finally, draw a strikethrough if necessary.
+                if (style.flags.strikethrough) self.addStrikethrough(
+                    @intCast(x),
+                    @intCast(y),
+                    fg,
+                    alpha,
+                ) catch |err| {
+                    log.warn(
+                        "error adding strikethrough to cell, will be invalid x={} y={}, err={}",
+                        .{ x, y, err },
+                    );
+                };
+            }
         }
 
         /// Add an underline decoration to the specified cell
@@ -3107,15 +3446,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             x: terminal.size.CellCountInt,
             y: terminal.size.CellCountInt,
-            cell_pin: terminal.Pin,
+            cols: usize,
+            cell_raws: []const terminal.page.Cell,
             shaper_cell: font.shape.Cell,
             shaper_run: font.shape.TextRun,
             color: terminal.color.RGB,
             alpha: u8,
         ) !void {
-            const rac = cell_pin.rowAndCell();
-            const cell = rac.cell;
-
+            const cell = cell_raws[x];
             const cp = cell.codepoint();
 
             // Render
@@ -3135,7 +3473,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (cellpkg.isSymbol(cp)) .{
                             .size = .fit,
                         } else .none,
-                    .constraint_width = constraintWidth(cell_pin),
+                    .constraint_width = constraintWidth(
+                        cell_raws,
+                        x,
+                        cols,
+                    ),
                 },
             );
 
@@ -3164,22 +3506,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         fn addCursor(
             self: *Self,
-            screen: *terminal.Screen,
+            cursor_state: *const terminal.RenderState.Cursor,
             cursor_style: renderer.CursorStyle,
             cursor_color: terminal.color.RGB,
         ) void {
+            const cursor_vp = cursor_state.viewport orelse return;
+
             // Add the cursor. We render the cursor over the wide character if
             // we're on the wide character tail.
             const wide, const x = cell: {
                 // The cursor goes over the screen cursor position.
-                const cell = screen.cursor.page_cell;
-                if (cell.wide != .spacer_tail or screen.cursor.x == 0)
-                    break :cell .{ cell.wide == .wide, screen.cursor.x };
+                if (!cursor_vp.wide_tail) break :cell .{
+                    cursor_state.cell.wide == .wide,
+                    cursor_vp.x,
+                };
 
-                // If we're part of a wide character, we move the cursor back to
-                // the actual character.
-                const prev_cell = screen.cursorCellLeft(1);
-                break :cell .{ prev_cell.wide == .wide, screen.cursor.x - 1 };
+                // If we're part of a wide character, we move the cursor back
+                // to the actual character.
+                break :cell .{ true, cursor_vp.x - 1 };
             };
 
             const alpha: u8 = if (!self.focused) 255 else alpha: {
@@ -3238,7 +3582,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ x, screen.cursor.y },
+                .grid_pos = .{ x, cursor_vp.y },
                 .color = .{ cursor_color.r, cursor_color.g, cursor_color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
@@ -3253,18 +3597,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             cp: renderer.State.Preedit.Codepoint,
             coord: terminal.Coordinate,
+            screen_fg: terminal.color.RGB,
         ) !void {
-            // Preedit is rendered inverted
-            const bg = self.foreground_color orelse self.default_foreground_color;
-            const fg = self.background_color orelse self.default_background_color;
-
             // Render the glyph for our preedit text
             const render_ = self.font_grid.renderCodepoint(
                 self.alloc,
                 @intCast(cp.codepoint),
                 .regular,
                 .text,
-                .{ .grid_metrics = self.grid_metrics },
+                .{
+                    .grid_metrics = self.grid_metrics,
+                    .thicken = self.config.font_thicken,
+                    .thicken_strength = self.config.font_thicken_strength,
+                },
             ) catch |err| {
                 log.warn("error rendering preedit glyph err={}", .{err});
                 return;
@@ -3274,21 +3619,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return;
             };
 
-            // Add our opaque background cell
-            self.cells.bgCell(coord.y, coord.x).* = .{
-                bg.r, bg.g, bg.b, 255,
-            };
-            if (cp.wide and coord.x < self.cells.size.columns - 1) {
-                self.cells.bgCell(coord.y, coord.x + 1).* = .{
-                    bg.r, bg.g, bg.b, 255,
-                };
-            }
-
             // Add our text
             try self.cells.add(self.alloc, .text, .{
                 .atlas = .grayscale,
                 .grid_pos = .{ @intCast(coord.x), @intCast(coord.y) },
-                .color = .{ fg.r, fg.g, fg.b, 255 },
+                .color = .{ screen_fg.r, screen_fg.g, screen_fg.b, 255 },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
                 .bearings = .{
@@ -3296,6 +3631,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_y),
                 },
             });
+
+            // Add underline
+            try self.addUnderline(@intCast(coord.x), @intCast(coord.y), .single, screen_fg, 255);
+            if (cp.wide and coord.x < self.cells.size.columns - 1) {
+                try self.addUnderline(@intCast(coord.x + 1), @intCast(coord.y), .single, screen_fg, 255);
+            }
         }
 
         /// Sync the atlas data to the given texture. This copies the bytes

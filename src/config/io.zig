@@ -1,5 +1,5 @@
 const std = @import("std");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const string = @import("string.zig");
@@ -156,7 +156,7 @@ pub const RepeatableReadableIO = struct {
     const Self = @This();
 
     // Allocator for the list is the arena for the parent config.
-    list: std.ArrayListUnmanaged(ReadableIO) = .{},
+    list: std.ArrayList(ReadableIO) = .empty,
 
     pub fn parseCLI(
         self: *Self,

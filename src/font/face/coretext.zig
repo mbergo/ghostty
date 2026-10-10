@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const assert = std.debug.assert;
+const assert = @import("../../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const macos = @import("macos");
 const harfbuzz = @import("harfbuzz");
@@ -291,7 +291,7 @@ pub const Face = struct {
         alloc: Allocator,
         atlas: *font.Atlas,
         glyph_index: u32,
-        opts: font.face.RenderOptions,
+        opts: font.Glyph.RenderOptions,
     ) !font.Glyph {
         var glyphs = [_]macos.graphics.Glyph{@intCast(glyph_index)};
 
@@ -367,9 +367,16 @@ pub const Face = struct {
         // We don't do this if the glyph has a stretch constraint,
         // since in that case the position was already calculated with the
         // new cell width in mind.
-        if ((constraint.size != .stretch) and (metrics.face_width < cell_width)) {
+        if (constraint.size != .stretch) {
             // We add half the difference to re-center.
-            x += (cell_width - metrics.face_width) / 2;
+            const dx = (cell_width - metrics.face_width) / 2;
+            x += dx;
+            if (dx < 0) {
+                // For negative diff (cell narrower than advance), we remove the
+                // integer part and only keep the fractional adjustment needed
+                // for consistent subpixel positioning.
+                x -= @trunc(dx);
+            }
         }
 
         // If this is a bitmap glyph, it will always render as full pixels,
@@ -919,6 +926,7 @@ const ColorState = struct {
             const svg = opentype.SVG.init(ptr[0..len]) catch |err| {
                 return switch (err) {
                     error.EndOfStream,
+                    error.ReadFailed,
                     error.SVGVersionNotSupported,
                     => error.InvalidSVGTable,
                 };

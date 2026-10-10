@@ -4,8 +4,6 @@ const IOSurfaceLayer = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
-const builtin = @import("builtin");
 const objc = @import("objc");
 const macos = @import("macos");
 
@@ -42,6 +40,10 @@ pub fn init() !IOSurfaceLayer {
 }
 
 pub fn release(self: *IOSurfaceLayer) void {
+    // The layer may be retained by the view after we release our reference.
+    // Clear the callback first so that a later display pass can't access the
+    // renderer that owned this wrapper after it has been freed.
+    self.setDisplayCallback(null, null);
     self.layer.release();
 }
 

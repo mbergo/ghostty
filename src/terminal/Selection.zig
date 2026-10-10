@@ -2,7 +2,9 @@
 const Selection = @This();
 
 const std = @import("std");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
+const Allocator = std.mem.Allocator;
+const lib = @import("lib.zig");
 const page = @import("page.zig");
 const point = @import("point.zig");
 const PageList = @import("PageList.zig");
@@ -126,7 +128,7 @@ pub fn tracked(self: *const Selection) bool {
 
 /// Convert this selection a tracked selection. It is asserted this is
 /// an untracked selection. The tracked selection is returned.
-pub fn track(self: *const Selection, s: *Screen) !Selection {
+pub fn track(self: *const Selection, s: *Screen) Allocator.Error!Selection {
     assert(!self.tracked());
 
     // Track our pins
@@ -153,12 +155,12 @@ pub fn topLeft(self: Selection, s: *const Screen) Pin {
         .reverse => self.end(),
         .mirrored_forward => pin: {
             var p = self.start();
-            p.x = self.end().x;
+            p.x = @min(self.end().x, p.node.cols() - 1);
             break :pin p;
         },
         .mirrored_reverse => pin: {
             var p = self.end();
-            p.x = self.start().x;
+            p.x = @min(self.start().x, p.node.cols() - 1);
             break :pin p;
         },
     };
@@ -171,12 +173,12 @@ pub fn bottomRight(self: Selection, s: *const Screen) Pin {
         .reverse => self.start(),
         .mirrored_forward => pin: {
             var p = self.end();
-            p.x = self.start().x;
+            p.x = @min(self.start().x, p.node.cols() - 1);
             break :pin p;
         },
         .mirrored_reverse => pin: {
             var p = self.start();
-            p.x = self.end().x;
+            p.x = @min(self.end().x, p.node.cols() - 1);
             break :pin p;
         },
     };
@@ -194,7 +196,12 @@ pub fn bottomRight(self: Selection, s: *const Screen) Pin {
 ///  operations only flip the x or y axis, not both. Depending on the y axis
 ///  direction, this is either mirrored_forward or mirrored_reverse.
 ///
-pub const Order = enum { forward, reverse, mirrored_forward, mirrored_reverse };
+pub const Order = lib.Enum(lib.target, &.{
+    "forward",
+    "reverse",
+    "mirrored_forward",
+    "mirrored_reverse",
+});
 
 pub fn order(self: Selection, s: *const Screen) Order {
     const start_pt = s.pages.pointFromPin(.screen, self.start()).?.screen;
@@ -280,23 +287,61 @@ pub fn contains(self: Selection, s: *const Screen, pin: Pin) bool {
 
 /// Get a selection for a single row in the screen. This will return null
 /// if the row is not included in the selection.
+///
+/// This is a very expensive operation. It has to traverse the linked list
+/// of pages for the top-left, bottom-right, and the given pin to find
+/// the coordinates. If you are calling this repeatedly, prefer
+/// `containedRowCached`.
 pub fn containedRow(self: Selection, s: *const Screen, pin: Pin) ?Selection {
     const tl_pin = self.topLeft(s);
     const br_pin = self.bottomRight(s);
 
     // This is definitely not very efficient. Low-hanging fruit to
-    // improve this.
+    // improve this. Callers should prefer containedRowCached if they
+    // can swing it.
     const tl = s.pages.pointFromPin(.screen, tl_pin).?.screen;
     const br = s.pages.pointFromPin(.screen, br_pin).?.screen;
     const p = s.pages.pointFromPin(.screen, pin).?.screen;
 
+    return self.containedRowCached(
+        s,
+        tl_pin,
+        br_pin,
+        pin,
+        tl,
+        br,
+        p,
+    );
+}
+
+/// Same as containedRow but useful if you're calling it repeatedly
+/// so that the pins can be cached across calls. Advanced.
+pub fn containedRowCached(
+    self: Selection,
+    s: *const Screen,
+    tl_pin: Pin,
+    br_pin: Pin,
+    pin: Pin,
+    tl: point.Coordinate,
+    br: point.Coordinate,
+    p: point.Coordinate,
+) ?Selection {
+    _ = s;
     if (p.y < tl.y or p.y > br.y) return null;
 
     // Rectangle case: we can return early as the x range will always be the
     // same. We've already validated that the row is in the selection.
     if (self.rectangle) return init(
-        s.pages.pin(.{ .screen = .{ .y = p.y, .x = tl.x } }).?,
-        s.pages.pin(.{ .screen = .{ .y = p.y, .x = br.x } }).?,
+        start: {
+            var copy: Pin = pin;
+            copy.x = @min(tl.x, copy.node.cols() - 1);
+            break :start copy;
+        },
+        end: {
+            var copy: Pin = pin;
+            copy.x = @min(br.x, copy.node.cols() - 1);
+            break :end copy;
+        },
         true,
     );
 
@@ -309,7 +354,11 @@ pub fn containedRow(self: Selection, s: *const Screen, pin: Pin) ?Selection {
         // Selection top-left line matches only.
         return init(
             tl_pin,
-            s.pages.pin(.{ .screen = .{ .y = p.y, .x = s.pages.cols - 1 } }).?,
+            end: {
+                var copy: Pin = pin;
+                copy.x = copy.node.cols() - 1;
+                break :end copy;
+            },
             false,
         );
     }
@@ -320,7 +369,11 @@ pub fn containedRow(self: Selection, s: *const Screen, pin: Pin) ?Selection {
     if (p.y == br.y) {
         assert(p.y != tl.y);
         return init(
-            s.pages.pin(.{ .screen = .{ .y = p.y, .x = 0 } }).?,
+            start: {
+                var copy: Pin = pin;
+                copy.x = 0;
+                break :start copy;
+            },
             br_pin,
             false,
         );
@@ -328,25 +381,33 @@ pub fn containedRow(self: Selection, s: *const Screen, pin: Pin) ?Selection {
 
     // Row is somewhere between our selection lines so we return the full line.
     return init(
-        s.pages.pin(.{ .screen = .{ .y = p.y, .x = 0 } }).?,
-        s.pages.pin(.{ .screen = .{ .y = p.y, .x = s.pages.cols - 1 } }).?,
+        start: {
+            var copy: Pin = pin;
+            copy.x = 0;
+            break :start copy;
+        },
+        end: {
+            var copy: Pin = pin;
+            copy.x = copy.node.cols() - 1;
+            break :end copy;
+        },
         false,
     );
 }
 
 /// Possible adjustments to the selection.
-pub const Adjustment = enum {
-    left,
-    right,
-    up,
-    down,
-    home,
-    end,
-    page_up,
-    page_down,
-    beginning_of_line,
-    end_of_line,
-};
+pub const Adjustment = lib.Enum(lib.target, &.{
+    "left",
+    "right",
+    "up",
+    "down",
+    "home",
+    "end",
+    "page_up",
+    "page_down",
+    "beginning_of_line",
+    "end_of_line",
+});
 
 /// Adjust the selection by some given adjustment. An adjustment allows
 /// a selection to be expanded slightly left, right, up, down, etc.
@@ -372,7 +433,7 @@ pub fn adjust(
             var current = end_pin.*;
             while (current.down(1)) |next| : (current = next) {
                 const rac = next.rowAndCell();
-                const cells = next.node.data.getCells(rac.row);
+                const cells = next.node.page().getCells(rac.row);
                 if (page.Cell.hasTextAny(cells)) {
                     end_pin.* = next;
                     break;
@@ -434,7 +495,7 @@ pub fn adjust(
             );
             while (it.next()) |next| {
                 const rac = next.rowAndCell();
-                const cells = next.node.data.getCells(rac.row);
+                const cells = next.node.page().getCells(rac.row);
                 if (page.Cell.hasTextAny(cells)) {
                     end_pin.* = next;
                     end_pin.x = @intCast(cells.len - 1);
@@ -445,13 +506,13 @@ pub fn adjust(
 
         .beginning_of_line => end_pin.x = 0,
 
-        .end_of_line => end_pin.x = end_pin.node.data.size.cols - 1,
+        .end_of_line => end_pin.x = end_pin.node.cols() - 1,
     }
 }
 
 test "Selection: adjust right" {
     const testing = std.testing;
-    var s = try Screen.init(testing.allocator, 10, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("A1234\nB5678\nC1234\nD5678");
 
@@ -518,7 +579,7 @@ test "Selection: adjust right" {
 
 test "Selection: adjust left" {
     const testing = std.testing;
-    var s = try Screen.init(testing.allocator, 10, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("A1234\nB5678\nC1234\nD5678");
 
@@ -567,7 +628,7 @@ test "Selection: adjust left" {
 
 test "Selection: adjust left skips blanks" {
     const testing = std.testing;
-    var s = try Screen.init(testing.allocator, 10, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("A1234\nB5678\nC12\nD56");
 
@@ -616,7 +677,7 @@ test "Selection: adjust left skips blanks" {
 
 test "Selection: adjust up" {
     const testing = std.testing;
-    var s = try Screen.init(testing.allocator, 10, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("A\nB\nC\nD\nE");
 
@@ -663,7 +724,7 @@ test "Selection: adjust up" {
 
 test "Selection: adjust down" {
     const testing = std.testing;
-    var s = try Screen.init(testing.allocator, 10, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("A\nB\nC\nD\nE");
 
@@ -710,7 +771,7 @@ test "Selection: adjust down" {
 
 test "Selection: adjust down with not full screen" {
     const testing = std.testing;
-    var s = try Screen.init(testing.allocator, 10, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("A\nB\nC");
 
@@ -738,7 +799,7 @@ test "Selection: adjust down with not full screen" {
 
 test "Selection: adjust home" {
     const testing = std.testing;
-    var s = try Screen.init(testing.allocator, 10, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("A\nB\nC");
 
@@ -766,7 +827,7 @@ test "Selection: adjust home" {
 
 test "Selection: adjust end with not full screen" {
     const testing = std.testing;
-    var s = try Screen.init(testing.allocator, 10, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("A\nB\nC");
 
@@ -794,7 +855,7 @@ test "Selection: adjust end with not full screen" {
 
 test "Selection: adjust beginning of line" {
     const testing = std.testing;
-    var s = try Screen.init(testing.allocator, 8, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 8, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("A12 B34\nC12 D34");
 
@@ -864,7 +925,7 @@ test "Selection: adjust beginning of line" {
 
 test "Selection: adjust end of line" {
     const testing = std.testing;
-    var s = try Screen.init(testing.allocator, 8, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 8, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("A12 B34\nC12 D34");
 
@@ -933,8 +994,9 @@ test "Selection: adjust end of line" {
 test "Selection: order, standard" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var s = try Screen.init(alloc, 100, 100, 1);
+    var s = try Screen.init(io, alloc, .{ .cols = 100, .rows = 100, .max_scrollback_bytes = 1 });
     defer s.deinit();
 
     {
@@ -994,11 +1056,38 @@ test "Selection: order, standard" {
     }
 }
 
+test "Selection: rectangle corners clamp across mixed-width pages" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{
+        .cols = 4,
+        .rows = 2,
+        .max_scrollback_bytes = 0,
+    });
+    defer s.deinit();
+
+    const first = s.pages.pages.first.?;
+    try s.pages.split(.{ .node = first, .y = 1 });
+    const second = first.next.?;
+    second.page().size.cols = 2;
+
+    const sel = Selection.init(
+        .{ .node = first, .x = 3 },
+        .{ .node = second, .x = 1 },
+        true,
+    );
+    try testing.expectEqual(.mirrored_forward, sel.order(&s));
+
+    const bottom_right = sel.bottomRight(&s);
+    _ = bottom_right.rowAndCell();
+    try testing.expect((Pin{ .node = second, .x = 1 }).eql(bottom_right));
+}
+
 test "Selection: order, rectangle" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var s = try Screen.init(alloc, 100, 100, 1);
+    var s = try Screen.init(io, alloc, .{ .cols = 100, .rows = 100, .max_scrollback_bytes = 1 });
     defer s.deinit();
 
     // Conventions:
@@ -1110,7 +1199,7 @@ test "Selection: order, rectangle" {
 test "topLeft" {
     const testing = std.testing;
 
-    var s = try Screen.init(testing.allocator, 10, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     {
         // forward
@@ -1173,7 +1262,7 @@ test "topLeft" {
 test "bottomRight" {
     const testing = std.testing;
 
-    var s = try Screen.init(testing.allocator, 10, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     {
         // forward
@@ -1236,7 +1325,7 @@ test "bottomRight" {
 test "ordered" {
     const testing = std.testing;
 
-    var s = try Screen.init(testing.allocator, 10, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     {
         // forward
@@ -1317,7 +1406,7 @@ test "ordered" {
 test "Selection: contains" {
     const testing = std.testing;
 
-    var s = try Screen.init(testing.allocator, 10, 10, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10, .max_scrollback_bytes = 0 });
     defer s.deinit();
     {
         const sel = Selection.init(
@@ -1363,7 +1452,7 @@ test "Selection: contains" {
 test "Selection: contains, rectangle" {
     const testing = std.testing;
 
-    var s = try Screen.init(testing.allocator, 15, 15, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 15, .rows = 15, .max_scrollback_bytes = 0 });
     defer s.deinit();
     {
         const sel = Selection.init(
@@ -1425,7 +1514,7 @@ test "Selection: contains, rectangle" {
 
 test "Selection: containedRow" {
     const testing = std.testing;
-    var s = try Screen.init(testing.allocator, 10, 5, 0);
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 5, .max_scrollback_bytes = 0 });
     defer s.deinit();
 
     {
@@ -1541,4 +1630,47 @@ test "Selection: containedRow" {
             s.pages.pin(.{ .screen = .{ .x = 1, .y = 1 } }).?,
         ).?);
     }
+}
+
+test "Selection: containedRow clamps mixed-width pages" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{
+        .cols = 4,
+        .rows = 3,
+        .max_scrollback_bytes = 0,
+    });
+    defer s.deinit();
+
+    const first = s.pages.pages.first.?;
+    try s.pages.split(.{ .node = first, .y = 2 });
+    try s.pages.split(.{ .node = first, .y = 1 });
+    const middle = first.next.?;
+    const last = middle.next.?;
+    middle.page().size.cols = 2;
+
+    const linear = Selection.init(
+        .{ .node = first, .x = 1 },
+        .{ .node = last, .x = 1 },
+        false,
+    );
+    const linear_row = linear.containedRow(
+        &s,
+        .{ .node = middle },
+    ).?;
+    _ = linear_row.end().rowAndCell();
+    try testing.expect((Pin{ .node = middle }).eql(linear_row.start()));
+    try testing.expect((Pin{ .node = middle, .x = 1 }).eql(linear_row.end()));
+
+    const rectangle = Selection.init(
+        .{ .node = first, .x = 1 },
+        .{ .node = last, .x = 3 },
+        true,
+    );
+    const rectangle_row = rectangle.containedRow(
+        &s,
+        .{ .node = middle },
+    ).?;
+    _ = rectangle_row.end().rowAndCell();
+    try testing.expect((Pin{ .node = middle, .x = 1 }).eql(rectangle_row.start()));
+    try testing.expect((Pin{ .node = middle, .x = 1 }).eql(rectangle_row.end()));
 }

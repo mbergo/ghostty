@@ -3,8 +3,6 @@ const Self = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
-const builtin = @import("builtin");
 const gl = @import("opengl");
 
 const OpenGL = @import("../OpenGL.zig");
@@ -52,17 +50,17 @@ pub fn init(
     {
         const texbind = tex.bind(opts.target) catch return error.OpenGLFailed;
         defer texbind.unbind();
-        texbind.parameter(.WrapS, @intFromEnum(opts.wrap_s)) catch return error.OpenGLFailed;
-        texbind.parameter(.WrapT, @intFromEnum(opts.wrap_t)) catch return error.OpenGLFailed;
-        texbind.parameter(.MinFilter, @intFromEnum(opts.min_filter)) catch return error.OpenGLFailed;
-        texbind.parameter(.MagFilter, @intFromEnum(opts.mag_filter)) catch return error.OpenGLFailed;
+        texbind.parameter(.wrap_s, opts.wrap_s) catch return error.OpenGLFailed;
+        texbind.parameter(.wrap_t, opts.wrap_t) catch return error.OpenGLFailed;
+        texbind.parameter(.min_filter, opts.min_filter) catch return error.OpenGLFailed;
+        texbind.parameter(.mag_filter, opts.mag_filter) catch return error.OpenGLFailed;
         texbind.image2D(
             0,
             opts.internal_format,
             @intCast(width),
             @intCast(height),
             opts.format,
-            .UnsignedByte,
+            .unsigned_byte,
             if (data) |d| @ptrCast(d.ptr) else null,
         ) catch return error.OpenGLFailed;
     }
@@ -100,7 +98,7 @@ pub fn replaceRegion(
         @intCast(width),
         @intCast(height),
         self.format,
-        .UnsignedByte,
+        .unsigned_byte,
         data.ptr,
     ) catch return error.OpenGLFailed;
 }

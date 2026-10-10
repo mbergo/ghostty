@@ -9,7 +9,7 @@ for any localization that they may add.
 
 ## GTK
 
-In the GTK app runtime, translable strings are mainly sourced from Blueprint
+In the GTK app runtime, translatable strings are mainly sourced from Blueprint
 files (located under `src/apprt/gtk/ui`). Blueprints have a native syntax for
 translatable strings, which look like this:
 
@@ -43,6 +43,30 @@ else
 
 const label = gtk.Label.new(text);
 ```
+
+If a string must be stored untranslated and only translated later, use
+`i18n.N_` instead. This marks the string for extraction into the translation
+template but returns the original msgid unchanged. A common use case is
+compile-time or static metadata that is translated only when it is presented
+to the user.
+
+```zig
+const i18n = @import("i18n.zig");
+
+const Command = struct {
+    title: [:0]const u8,
+};
+
+const cmd = Command{
+    .title = i18n.N_("Reset Terminal"),
+};
+
+const label = gtk.Label.new(i18n._(cmd.title));
+```
+
+If `i18n._` is called at comptime, it returns the original msgid unchanged
+while still marking the string for translation. For strings that are stored
+untranslated and translated later, prefer `i18n.N_`.
 
 All translatable strings are extracted into the _translation template file_,
 located under `po/com.mitchellh.ghostty.pot`. **This file must stay in sync with

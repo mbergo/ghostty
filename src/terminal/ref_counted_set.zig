@@ -1,11 +1,10 @@
 const std = @import("std");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
+const testing = std.testing;
 
 const size = @import("size.zig");
 const Offset = size.Offset;
 const OffsetBuf = size.OffsetBuf;
-
-const fastmem = @import("../fastmem.zig");
 
 /// A reference counted set.
 ///
@@ -65,6 +64,20 @@ pub fn RefCountedSet(
             @alignOf(Item),
             @alignOf(Id),
         ));
+
+        /// This is the max load until the set returns OutOfMemory and
+        /// requires more capacity.
+        ///
+        /// Experimentally, this load factor works quite well.
+        pub const load_factor = 0.8125;
+
+        /// Returns the minimum capacity needed to store `n` items,
+        /// accounting for the load factor and the reserved ID 0.
+        pub fn capacityForCount(n: usize) usize {
+            if (n == 0) return 0;
+            // +1 because ID 0 is reserved, so we need at least n+1 slots.
+            return @intFromFloat(@ceil(@as(f64, @floatFromInt(n + 1)) / load_factor));
+        }
 
         /// Set item
         pub const Item = struct {
@@ -156,9 +169,6 @@ pub fn RefCountedSet(
             /// The returned layout `cap` property will be 1 more than the number
             /// of items that the set can actually store, since ID 0 is reserved.
             pub fn init(cap: usize) Layout {
-                // Experimentally, this load factor works quite well.
-                const load_factor = 0.8125;
-
                 assert(cap <= @as(usize, @intCast(std.math.maxInt(Id))) + 1);
 
                 // Zero-cap set is valid, return special case
@@ -202,6 +212,30 @@ pub fn RefCountedSet(
             @memset(table.ptr(base)[0..l.table_cap], 0);
             @memset(items.ptr(base)[0..l.cap], .{});
 
+            return initFromParts(table, items, l, context);
+        }
+
+        /// Like `init`, but for backing memory that the caller guarantees
+        /// is already zero-filled (e.g. fresh OS pages). This writes
+        /// nothing to the backing buffer, so the OS pages behind the table
+        /// and items stay untouched until the first `add`.
+        ///
+        /// Behavior is undefined if the backing memory is not zero.
+        pub fn initAssumeZeroed(base: OffsetBuf, l: Layout, context: Context) Self {
+            return initFromParts(
+                base.member(Id, l.table_start),
+                base.member(Item, l.items_start),
+                l,
+                context,
+            );
+        }
+
+        fn initFromParts(
+            table: Offset(Id),
+            items: Offset(Item),
+            l: Layout,
+            context: Context,
+        ) Self {
             return .{
                 .table = table,
                 .items = items,
@@ -217,7 +251,7 @@ pub fn RefCountedSet(
             OutOfMemory,
 
             /// The set needs to be rehashed, as there are many dead
-            /// items with lower IDs which are inaccessible for re-use.
+            /// items with lower IDs which are inaccessible for reuse.
             NeedsRehash,
         };
 
@@ -256,6 +290,7 @@ pub fn RefCountedSet(
             // we may end up with a PSL of `len` which would exceed the bounds.
             // In such a case, we claim to be out of memory.
             if (self.psl_stats[self.psl_stats.len - 1] > 0) {
+                @branchHint(.cold);
                 return AddError.OutOfMemory;
             }
 
@@ -306,14 +341,27 @@ pub fn RefCountedSet(
 
             if (id < self.next_id) {
                 if (items[id].meta.ref == 0) {
+                    // Requested ID is dead, but if the value exists not under
+                    // another ID then ref count that and increase the ID.
+                    if (self.lookupContext(base, value, ctx)) |existing_id| {
+                        // Notify the context that the value is "deleted"
+                        // because we're reusing the existing value in the
+                        // set. This allows callers to clean up any
+                        // resources associated with the value.
+                        if (comptime @hasDecl(Context, "deleted")) ctx.deleted(value);
+
+                        items[existing_id].meta.ref += 1;
+                        return existing_id;
+                    }
+
                     // See comment in `addContext` for details.
                     if (self.psl_stats[self.psl_stats.len - 1] > 0) {
+                        @branchHint(.cold);
                         return AddError.OutOfMemory;
                     }
 
                     self.deleteItem(base, id, ctx);
-
-                    const added_id = self.upsert(base, value, id, ctx);
+                    const added_id = self.insert(base, value, id, ctx);
 
                     items[added_id].meta.ref += 1;
 
@@ -436,8 +484,49 @@ pub fn RefCountedSet(
             return self.living;
         }
 
+        /// A live entry returned by `Iterator`.
+        pub const Entry = struct {
+            id: Id,
+            value_ptr: *T,
+        };
+
+        /// Iterates live entries in ascending ID order.
+        ///
+        /// Released entries whose reference count reached zero are skipped.
+        /// Any mutation of the set invalidates the iterator.
+        pub const Iterator = struct {
+            items: [*]Item,
+            id: Id = 1,
+            end: Id,
+
+            pub fn next(self: *Iterator) ?Entry {
+                while (self.id < self.end) {
+                    const id = self.id;
+                    self.id += 1;
+
+                    const item = &self.items[id];
+                    if (item.meta.ref == 0) continue;
+
+                    return .{
+                        .id = id,
+                        .value_ptr = &item.value,
+                    };
+                }
+
+                return null;
+            }
+        };
+
+        /// Return an iterator over the live entries in this set.
+        pub fn iterator(self: *const Self, base: anytype) Iterator {
+            return .{
+                .items = self.items.ptr(base),
+                .end = self.next_id,
+            };
+        }
+
         /// Delete an item, removing any references from
-        /// the table, and freeing its ID to be re-used.
+        /// the table, and freeing its ID to be reused.
         fn deleteItem(self: *Self, base: anytype, id: Id, ctx: Context) void {
             const table = self.table.ptr(base);
             const items = self.items.ptr(base);
@@ -486,6 +575,15 @@ pub fn RefCountedSet(
             return self.lookupContext(base, value, self.context);
         }
         pub fn lookupContext(self: *const Self, base: anytype, value: T, ctx: Context) ?Id {
+            // A zero-capacity set (a valid special case of Layout.init)
+            // contains nothing and has a zero-size table, so we can't
+            // probe it: table[0] would read whatever memory follows the
+            // set in the backing buffer.
+            if (self.layout.table_cap == 0) {
+                @branchHint(.cold);
+                return null;
+            }
+
             const table = self.table.ptr(base);
             const items = self.items.ptr(base);
 
@@ -513,14 +611,11 @@ pub fn RefCountedSet(
                     return null;
                 }
 
-                // We don't bother checking dead items.
-                if (item.meta.ref == 0) {
-                    continue;
-                }
-
                 // If the item is a part of the same probe sequence,
-                // we check if it matches the value we're looking for.
+                // we make sure it's not dead and then check to see
+                // if it matches the value we're looking for.
                 if (item.meta.psl == i and
+                    item.meta.ref > 0 and
                     ctx.eql(value, item.value))
                 {
                     return id;
@@ -530,28 +625,13 @@ pub fn RefCountedSet(
             return null;
         }
 
-        /// Find the provided value in the hash table, or add a new item
-        /// for it if not present. If a new item is added, `new_id` will
-        /// be used as the ID. If an existing item is found, the `new_id`
-        /// is ignored and the existing item's ID is returned.
-        fn upsert(self: *Self, base: anytype, value: T, new_id: Id, ctx: Context) Id {
-            // If the item already exists, return it.
-            if (self.lookupContext(base, value, ctx)) |id| {
-                // Notify the context that the value is "deleted" because
-                // we're reusing the existing value in the set. This allows
-                // callers to clean up any resources associated with the value.
-                if (comptime @hasDecl(Context, "deleted")) ctx.deleted(value);
-
-                return id;
-            }
-
-            return self.insert(base, value, new_id, ctx);
-        }
-
         /// Insert the given value into the hash table with the given ID.
-        /// asserts that the value is not already present in the table.
+        ///
+        /// If runtime safety is enabled, asserts that
+        /// the value is not already present in the table.
         fn insert(self: *Self, base: anytype, value: T, new_id: Id, ctx: Context) Id {
-            assert(self.lookupContext(base, value, ctx) == null);
+            if (comptime std.debug.runtime_safety)
+                assert(self.lookupContext(base, value, ctx) == null);
 
             const table = self.table.ptr(base);
             const items = self.items.ptr(base);
@@ -585,10 +665,15 @@ pub fn RefCountedSet(
                 const item = &items[id];
 
                 // If there's a dead item then we resurrect it
-                // for our value so that we can re-use its ID,
+                // for our value so that we can reuse its ID,
                 // unless its ID is greater than the one we're
                 // given (i.e. prefer smaller IDs).
                 if (item.meta.ref == 0) {
+                    // Dead items aren't super common relative
+                    // to other places to insert/swap the held
+                    // item in to the set.
+                    @branchHint(.unlikely);
+
                     if (comptime @hasDecl(Context, "deleted")) {
                         // Inform the context struct that we're
                         // deleting the dead item's value for good.
@@ -640,7 +725,7 @@ pub fn RefCountedSet(
             }
 
             // Our chosen ID may have changed if we decided
-            // to re-use a dead item's ID, so we make sure
+            // to reuse a dead item's ID, so we make sure
             // the chosen bucket contains the correct ID.
             table[new_item.meta.bucket] = chosen_id;
 
@@ -665,7 +750,9 @@ pub fn RefCountedSet(
 
                 var psl_stats: [32]Id = @splat(0);
 
-                for (items[0..self.layout.cap], 0..) |item, id| {
+                // Start at item 1 because item 0 is reserved and never
+                // assigned to. Its metadata doesn't matter.
+                for (items[1..self.next_id], 1..) |item, id| {
                     if (item.meta.bucket < std.math.maxInt(Id)) {
                         assert(table[item.meta.bucket] == id);
                         psl_stats[item.meta.psl] += 1;
@@ -679,6 +766,7 @@ pub fn RefCountedSet(
                 psl_stats = @splat(0);
 
                 for (table[0..self.layout.table_cap], 0..) |id, bucket| {
+                    if (id == 0) continue;
                     const item = items[id];
                     if (item.meta.bucket < std.math.maxInt(Id)) {
                         assert(item.meta.bucket == bucket);
@@ -695,4 +783,108 @@ pub fn RefCountedSet(
             }
         }
     };
+}
+
+test "addWithId dead id resolving to an existing value" {
+    const alloc = testing.allocator;
+    const TestSet = RefCountedSet(
+        u32,
+        u16,
+        u16,
+        struct {
+            pub fn hash(_: *const @This(), value: u32) u64 {
+                return std.hash.int(value);
+            }
+
+            pub fn eql(_: *const @This(), a: u32, b: u32) bool {
+                return a == b;
+            }
+        },
+    );
+
+    const layout: TestSet.Layout = .init(8);
+    const buf = try alloc.alignedAlloc(
+        u8,
+        TestSet.base_align,
+        layout.total_size,
+    );
+    defer alloc.free(buf);
+
+    var set: TestSet = .init(.init(buf), layout, .{});
+
+    // Create a dead item between two live ones so that it can't
+    // be reaped by the trim loop in `add`, then release it. This
+    // mirrors a page style set after a styled run is erased.
+    const live = try set.add(buf, 11);
+    const released = try set.add(buf, 22);
+    const last = try set.add(buf, 33);
+    set.release(buf, released);
+    try testing.expectEqual(@as(usize, 2), set.count());
+
+    // Request the dead ID for a value that is already live under
+    // a different ID: we must resolve to the existing item and
+    // take a reference, without changing the living count.
+    const resolved = (try set.addWithId(buf, 11, released)).?;
+    try testing.expectEqual(live, resolved);
+    try testing.expectEqual(@as(u16, 2), set.refCount(buf, live));
+    try testing.expectEqual(@as(usize, 2), set.count());
+
+    // The living count must agree with the iterator.
+    var it = set.iterator(buf);
+    var iterated: usize = 0;
+    while (it.next()) |_| iterated += 1;
+    try testing.expectEqual(set.count(), iterated);
+
+    // The dead slot is still reusable for a value that is not
+    // in the set: the requested ID must be used (null return).
+    try testing.expectEqual(@as(?u16, null), try set.addWithId(buf, 44, released));
+    try testing.expectEqual(@as(u16, 1), set.refCount(buf, released));
+    try testing.expectEqual(@as(usize, 3), set.count());
+
+    _ = last;
+}
+
+test "iterator visits live entries in ID order" {
+    const alloc = testing.allocator;
+    const TestSet = RefCountedSet(
+        u32,
+        u16,
+        u16,
+        struct {
+            pub fn hash(_: *const @This(), value: u32) u64 {
+                return std.hash.int(value);
+            }
+
+            pub fn eql(_: *const @This(), a: u32, b: u32) bool {
+                return a == b;
+            }
+        },
+    );
+
+    const layout: TestSet.Layout = .init(8);
+    const buf = try alloc.alignedAlloc(
+        u8,
+        TestSet.base_align,
+        layout.total_size,
+    );
+    defer alloc.free(buf);
+
+    var set: TestSet = .init(.init(buf), layout, .{});
+    const first = try set.add(buf, 11);
+    const released = try set.add(buf, 22);
+    const last = try set.add(buf, 33);
+    _ = try set.add(buf, 11);
+    set.release(buf, released);
+
+    var it = set.iterator(buf);
+
+    const first_entry = it.next().?;
+    try testing.expectEqual(first, first_entry.id);
+    try testing.expectEqual(@as(u32, 11), first_entry.value_ptr.*);
+
+    const last_entry = it.next().?;
+    try testing.expectEqual(last, last_entry.id);
+    try testing.expectEqual(@as(u32, 33), last_entry.value_ptr.*);
+
+    try testing.expect(it.next() == null);
 }
